@@ -17,13 +17,15 @@ import mimetypes
 import threading
 import subprocess
 import zipfile
-from pathlib import Path
-from typing import List, Optional, Dict, Any
+import base64
+import tempfile
+from pathlib import Path as _Path
+from typing import List, Optional, Dict, Any, Tuple
 
 import requests
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 # ---------------- Vector DB ----------------
@@ -44,7 +46,6 @@ from PIL import Image
 import openpyxl
 import extract_msg
 
-from fastapi.responses import JSONResponse
 import traceback
 
 # ---------------- Embeddings: nomic-embed-text via ONNXRuntime ----------------
@@ -158,8 +159,9 @@ class NomicOnnxEmbedder:
 
 # ---------------- Configuration ----------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "45m")
 EMBED_MODEL_DIR = os.getenv("EMBED_MODEL_DIR", "/opt/adam/models/nomic-ai/nomic-embed-text")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "adam-large:latest")  # default to Adam Large
+CHAT_MODEL = os.getenv("CHAT_MODEL", "llama3:8b")  # default to fast 8B
 CHROMA_DIR = os.getenv("CHROMA_DIR", "/srv/rag/chroma")
 WATCH_DIR = os.getenv("WATCH_DIR", "/srv/rag/watched")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/srv/rag/uploads")
@@ -170,11 +172,9 @@ Q_MAX = int(os.getenv("INGEST_QUEUE_MAX", "8"))
 
 # ---------------- Model aliasing ----------------
 ALIAS_MAP = {
-    "Adam Large": "adam-large:latest",
+    # Keep any local aliases you still use; avoid mapping removed 70B family
     "Adam Lite": "adam-lite:latest",
-    "adam-large": "adam-large:latest",
     "adam-lite": "adam-lite:latest",
-    "llama3.3:70b": "llama3.3:70b",
     "llama3:8b": "llama3:8b",
 }
 DEFAULT_MODEL = CHAT_MODEL
@@ -226,7 +226,7 @@ SUPPORTED = (
 )
 
 
-def sha1(path: Path) -> str:
+def sha1(path: _Path) -> str:
     h = hashlib.sha1()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -234,7 +234,7 @@ def sha1(path: Path) -> str:
     return h.hexdigest()
 
 
-def read_text(path: Path) -> str:
+def read_text(path: _Path) -> str:
     ext = path.suffix.lower()
 
     if ext == ".pdf":
@@ -388,7 +388,7 @@ def embed(texts: List[str]) -> List[List[float]]:
     return EMBEDDER.encode(texts, normalize_embeddings=True)
 
 
-def upsert_document(path: Path, source: str) -> int:
+def upsert_document(path: _Path, source: str) -> int:
     text = read_text(path)
     if not text:
         return 0
@@ -405,6 +405,48 @@ def upsert_document(path: Path, source: str) -> int:
     doc_sha = sha1(path)
     ids = [f"{doc_sha}:{i}" for i in range(len(chunks))]
     metas = [{"source": source, "path": str(path), "chunk": i} for i in range(len(chunks))]
+    collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
+    return len(chunks)
+
+
+def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
+    import json
+    safe: Dict[str, Any] = {}
+    for k, v in (meta or {}).items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            safe[k] = v
+        elif isinstance(v, (list, dict, tuple, set)):
+            try:
+                safe[k] = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                safe[k] = str(v)
+        else:
+            safe[k] = str(v)
+    return safe
+
+
+
+# -------- New: upsert pre-parsed TEXT (SharePoint path) --------
+def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
+    """Upsert pre-parsed TEXT (string) as chunks+embeddings, storing ONLY embeddings+metadata."""
+    text = (text or "").strip()
+    if not text:
+        return 0
+    try:
+        collection.delete(where={"doc_id": doc_id})
+    except Exception:
+        pass
+    chunks = chunk_text(text)
+    if not chunks:
+        return 0
+    embs = embed(chunks)
+    ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
+    metas = []
+    for i in range(len(chunks)):
+        m = _sanitize_metadata(dict(base_meta))
+        m["doc_id"] = doc_id
+        m["chunk"] = i
+        metas.append(m)
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
 
@@ -461,8 +503,13 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
     try:
         r = requests.post(
             f"{OLLAMA_URL}/api/chat",
-            json={"model": model_tag, "messages": messages, "stream": False,
-                  "options": {"temperature": 0.2, "num_predict": 300}},
+            json={
+                "model": model_tag,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.2, "num_predict": 300},
+                "keep_alive": OLLAMA_KEEP_ALIVE  # keep the 8B resident
+            },
             timeout=120
         )
     except Exception as e:
@@ -498,20 +545,48 @@ class QueryBody(BaseModel):
     k: int = 4
     history: Optional[List[dict]] = None
     model: Optional[str] = None  # "Adam Large", "Adam Lite", or raw Ollama tag
+    # New optional filters (non-breaking)
+    org: Optional[str] = None
+    category: Optional[str] = None
+    doc_code: Optional[str] = None
+    owner: Optional[str] = None
 
 
 @app.post("/query")
 def query_api(body: QueryBody):
-    hits = search(body.query, k=body.k)
+    # Use filtered search if filters provided; else regular search
+    if body.org or body.category or body.doc_code or body.owner:
+        hits = search_filtered(body.query, k=body.k,
+                               source=None, org=body.org, category=body.category,
+                               doc_code=body.doc_code, owner=body.owner)
+    else:
+        hits = search(body.query, k=body.k)
     answer = ask_with_context(body.query, hits, chat_history=body.history, model=body.model)
     used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()})
     filtered = [hits[i-1] for i in used if 1 <= i <= len(hits)] if used else []
-    return {"answer": answer, "sources": filtered}
+    # Return richer source objects (non-breaking for existing clients)
+    rich = []
+    for i, h in enumerate(hits):
+        meta = h.get("meta", {}) or {}
+        rich.append({
+            "index": i+1,
+            "title": meta.get("title"),
+            "org": meta.get("org"),
+            "category": meta.get("category"),
+            "version": meta.get("version"),
+            "revision_date": meta.get("revision_date"),
+            "doc_code": meta.get("doc_code"),
+            "sp_web_url": meta.get("sp_web_url"),
+            "path": meta.get("path"),   # present for legacy local docs
+            "score": h.get("score"),
+            "snippet": (h.get("text") or "")[:400]
+        })
+    return {"answer": answer, "sources": rich}
 
 
 @app.post("/upload")
 def upload_api(file: UploadFile = File(...)):
-    dest = Path(UPLOAD_DIR) / file.filename
+    dest = _Path(UPLOAD_DIR) / file.filename
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as f:
         f.write(file.file.read())
@@ -521,7 +596,7 @@ def upload_api(file: UploadFile = File(...)):
 
 @app.post("/reindex")
 def reindex_api():
-    root = Path(WATCH_DIR)
+    root = _Path(WATCH_DIR)
     count, total_chunks = 0, 0
     if not root.exists():
         return {"files": 0, "chunks": 0}
@@ -594,12 +669,34 @@ def embed_health():
         raise HTTPException(status_code=500, detail=f"Embed error: {e}")
 
 
+@app.get("/list_docs")
+def list_documents():
+    try:
+        collection = collection = client.get_or_create_collection(COLLECTION)
+
+        # Fetch all document entries with metadata
+        results = collection.get(include=["metadatas", "documents"], limit=10000)
+
+        docs = []
+        for i in range(len(results["ids"])):
+            doc_info = {
+                "doc_id": results["ids"][i],
+                "metadata": results["metadatas"][i],
+            }
+            docs.append(doc_info)
+
+        return JSONResponse(content={"documents": docs, "count": len(docs)})
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 # ---- folder watcher ----
 class Handler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             return
-        p = Path(event.src_path)
+        p = _Path(event.src_path)
         if p.suffix.lower() in SUPPORTED:
             try:
                 upsert_document(p, source="watched")
@@ -610,7 +707,7 @@ class Handler(FileSystemEventHandler):
         self.on_created(event)
 
 
-if Path(WATCH_DIR).exists():
+if _Path(WATCH_DIR).exists():
     obs = Observer()
     obs.schedule(Handler(), WATCH_DIR, recursive=True)
     obs.start()
@@ -626,7 +723,7 @@ def _ingest_worker():
         job_id, path, source = INGEST_Q.get()
         try:
             t0 = time.time()
-            chunks = upsert_document(Path(path), source=source)
+            chunks = upsert_document(_Path(path), source=source)
             JOBS[job_id] = {"status": "done", "path": path, "chunks": chunks, "ms": int((time.time() - t0) * 1000)}
         except Exception as e:
             JOBS[job_id] = {"status": "error", "path": path, "error": str(e)}
@@ -639,7 +736,7 @@ threading.Thread(target=_ingest_worker, daemon=True).start()
 
 @app.post("/upload_async")
 def upload_async_api(file: UploadFile = File(...)):
-    dest = Path(UPLOAD_DIR) / file.filename
+    dest = _Path(UPLOAD_DIR) / file.filename
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as f:
         f.write(file.file.read())
@@ -664,8 +761,8 @@ def job_status(job_id: str):
 
 
 # ---------------- Downloads ----------------
-def _is_under_allowed(p: Path) -> bool:
-    roots = [Path(UPLOAD_DIR).resolve(), Path(WATCH_DIR).resolve()]
+def _is_under_allowed(p: _Path) -> bool:
+    roots = [_Path(UPLOAD_DIR).resolve(), _Path(WATCH_DIR).resolve()]
     try:
         rp = p.resolve()
         for r in roots:
@@ -683,7 +780,7 @@ def _is_under_allowed(p: Path) -> bool:
 
 @app.get("/download")
 def download(path: str, inline: bool = False):
-    p = Path(path)
+    p = _Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "file not found")
     if not _is_under_allowed(p):
@@ -709,96 +806,13 @@ def download_zip(req: ZipRequest):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for raw in req.paths or []:
-            p = Path(raw)
+            p = _Path(raw)
             if not (p.exists() and p.is_file() and _is_under_allowed(p)):
                 continue
             z.write(str(p), arcname=p.name)
     buf.seek(0)
     headers = {"Content-Disposition": 'attachment; filename="documents.zip"'}
     return StreamingResponse(buf, media_type="application/zip", headers=headers)
-
-
-# ---------------- Listing (paged) ----------------
-@app.get("/list_page")
-def list_page(
-    page: int = 1,
-    size: int = 100,
-    source: Optional[str] = Query(None, description="upload|watched"),
-    prefix: Optional[str] = Query(None, description="path startswith filter"),
-):
-    data = collection.get(include=["metadatas"], limit=1_000_000)
-    paths = []
-    for m in data.get("metadatas", []):
-        if not m:
-            continue
-        p = m.get("path")
-        s = m.get("source")
-        if not p:
-            continue
-        if source and s != source:
-            continue
-        if prefix and not str(p).startswith(prefix):
-            continue
-        paths.append(p)
-    unique = sorted(set(paths))
-    total = len(unique)
-
-    page = max(page, 1)
-    size = max(min(size, 1000), 1)
-    start = (page - 1) * size
-    end = min(start + size, total)
-    items = unique[start:end]
-
-    return {
-        "page": page,
-        "size": size,
-        "total": total,
-        "has_next": end < total,
-        "next_page": page + 1 if end < total else None,
-        "items": items,
-    }
-
-
-@app.get("/list_details_page")
-def list_details_page(
-    page: int = 1,
-    size: int = 100,
-    source: Optional[str] = Query(None),
-    prefix: Optional[str] = Query(None),
-):
-    data = collection.get(include=["ids", "metadatas"], limit=1_000_000)
-    by_path: Dict[str, Dict[str, Any]] = {}
-    for _id, m in zip(data.get("ids", []), data.get("metadatas", [])):
-        if not m:
-            continue
-        p = m.get("path")
-        s = m.get("source")
-        if not p:
-            continue
-        if source and s != source:
-            continue
-        if prefix and not str(p).startswith(prefix):
-            continue
-        entry = by_path.setdefault(p, {"path": p, "source": s, "chunks": 0})
-        entry["chunks"] += 1
-
-    docs = sorted(by_path.values(), key=lambda r: r["path"])
-    total = len(docs)
-
-    page = max(page, 1)
-    size = max(min(size, 500), 1)
-    start = (page - 1) * size
-    end = min(start + size, total)
-    items = docs[start:end]
-
-    return {
-        "page": page,
-        "size": size,
-        "total": total,
-        "has_next": end < total,
-        "next_page": page + 1 if end < total else None,
-        "docs": items,
-    }
 
 
 # ---------------- Filtered search ----------------
@@ -809,6 +823,10 @@ def search_filtered(
     paths: Optional[List[str]] = None,
     prefix: Optional[str] = None,
     source: Optional[str] = None,
+    org: Optional[str] = None,
+    category: Optional[str] = None,
+    doc_code: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     qemb = embed([query])[0]
     include = ["documents", "metadatas", "distances"]
@@ -839,17 +857,23 @@ def search_filtered(
         except Exception:
             res = collection.query(query_embeddings=[qemb], n_results=max(k * 5, 20), include=include)
             results.extend([h for h in to_hits(res) if str(h["meta"].get("path", "")).startswith(prefix)])
-    elif source:
+    elif source or org or category or doc_code or owner:
+        where: Dict[str, Any] = {}
+        if source:   where["source"] = source
+        if org:      where["org"] = org
+        if category: where["category"] = category
+        if doc_code: where["doc_code"] = doc_code
+        if owner:    where["owner"] = owner
         res = collection.query(query_embeddings=[qemb], n_results=max(k, 12),
-                               include=include, where={"source": source})
+                               include=include, where=where)
         results.extend(to_hits(res))
     else:
         res = collection.query(query_embeddings=[qemb], n_results=k, include=include)
         results.extend(to_hits(res))
 
-    seen: Dict[Any, Dict[str, Any]] = {}
+    seen: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
     for h in results:
-        key = (h["meta"].get("path"), h["meta"].get("chunk"))
+        key = (h["meta"].get("doc_id") or h["meta"].get("path"), h["meta"].get("chunk"))
         if key not in seen or h["score"] > seen[key]["score"]:
             seen[key] = h
     hits = sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:k]
@@ -867,9 +891,163 @@ def query_path(body: Dict[str, Any] = Body(...)):
     source = body.get("source")
     model = body.get("model")
 
-    hits = search_filtered(query, k=k, path=path, paths=paths, prefix=prefix, source=source)
+    org = body.get("org")
+    category = body.get("category")
+    doc_code = body.get("doc_code")
+    owner = body.get("owner")
+
+    hits = search_filtered(query, k=k, path=path, paths=paths, prefix=prefix, source=source,
+                           org=org, category=category, doc_code=doc_code, owner=owner)
     answer = ask_with_context(query, hits, chat_history=history, model=model)
 
     used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()})
     filtered = [hits[i-1] for i in used if 1 <= i <= len(hits)] if used else []
     return {"answer": answer, "sources": filtered}
+
+
+# ---------------- New: Pydantic model for SharePoint ingest ----------------
+class IngestDocument(BaseModel):
+    # Identity & links (from SharePoint)
+    sp_site_id: Optional[str] = None
+    sp_list_id: Optional[str] = None
+    sp_item_id: Optional[str] = None
+    sp_drive_id: Optional[str] = None
+    sp_file_id: Optional[str] = None
+    sp_web_url: str
+
+    # Versioning
+    etag: Optional[str] = None
+    version_label: Optional[str] = None
+
+    # Core metadata
+    title: Optional[str] = None
+    doc_code: Optional[str] = None
+    org_code: Optional[str] = None
+    org: Optional[str] = None
+    category: Optional[str] = None
+    owner: Optional[str] = None
+    version: Optional[str] = None
+    revision_date: Optional[str] = None
+    latest_review_date: Optional[str] = None
+    document_review_date: Optional[str] = None
+    review_approval_date: Optional[str] = None
+    keywords: Optional[List[str]] = None
+    enterprise_keywords: Optional[List[str]] = None
+    association_ids: Optional[List[str]] = None
+    domain: Optional[str] = "HR"
+    allowed_groups: Optional[List[str]] = None
+
+    # Content options (you’ll use content_bytes)
+    file_name: Optional[str] = None
+    content_bytes: Optional[str] = None   # base64 of the file bytes
+    text_content: Optional[str] = None    # if you pre-extract text in your SP worker
+
+    # Optional overrides
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    persist: Optional[bool] = False       # ignored; never persist files locally
+
+
+# ---------------- New: SharePoint-first ingest (no local persistence) ----------------
+@app.post("/ingest_document")
+def ingest_document_api(body: IngestDocument):
+    """
+    Accept SharePoint metadata + content (base64 bytes or pre-extracted text),
+    parse to text in-memory (if needed), chunk, embed, upsert. No file persistence.
+    """
+    # Use per-request chunk overrides if provided
+    global CHUNK_SIZE, CHUNK_OVERLAP
+    orig_size, orig_overlap = CHUNK_SIZE, CHUNK_OVERLAP
+    try:
+        if body.chunk_size: CHUNK_SIZE = int(body.chunk_size)
+        if body.chunk_overlap: CHUNK_OVERLAP = int(body.chunk_overlap)
+
+        # Build stable versioned doc_id
+        version_key = body.version_label or body.etag or "v1"
+        spid = str(body.sp_item_id or body.sp_file_id or body.sp_web_url)
+        doc_id = f"{spid}:{version_key}"
+
+        # Base metadata attached to every chunk
+        base_meta = {
+            "source": "sharepoint",
+            "sp_site_id": body.sp_site_id,
+            "sp_list_id": body.sp_list_id,
+            "sp_item_id": body.sp_item_id,
+            "sp_drive_id": body.sp_drive_id,
+            "sp_file_id": body.sp_file_id,
+            "sp_web_url": body.sp_web_url,
+            "etag": body.etag,
+            "version_label": body.version_label,
+
+            "title": body.title,
+            "doc_code": body.doc_code,
+            "org_code": body.org_code,
+            "org": body.org,
+            "category": body.category,
+            "owner": body.owner,
+            "version": body.version,
+            "revision_date": body.revision_date,
+            "latest_review_date": body.latest_review_date,
+            "document_review_date": body.document_review_date,
+            "review_approval_date": body.review_approval_date,
+            "keywords": body.keywords or [],
+            "enterprise_keywords": body.enterprise_keywords or [],
+            "association_ids": body.association_ids or [],
+            "domain": body.domain or "HR",
+            "allowed_groups": body.allowed_groups or ["AllEmployees"],
+        }
+
+        # 1) If text provided, use directly (fastest)
+        if body.text_content and str(body.text_content).strip():
+            n = upsert_text(doc_id, body.text_content, base_meta)
+            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content"}
+
+        # 2) Else parse from base64 content bytes ephemerally
+        if body.content_bytes:
+            raw = base64.b64decode(body.content_bytes)
+            suffix = _Path(body.file_name).suffix if body.file_name else ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+                tmp = _Path(tf.name)
+                tf.write(raw)
+            try:
+                text = read_text(tmp)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except TypeError:
+                    if tmp.exists():
+                        tmp.unlink()
+            n = upsert_text(doc_id, text, base_meta)
+            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "content_bytes"}
+
+        raise HTTPException(status_code=400, detail="Provide either text_content or content_bytes.")
+    finally:
+        CHUNK_SIZE, CHUNK_OVERLAP = orig_size, orig_overlap
+
+
+# ---------------- New: Delete by SharePoint identity ----------------
+@app.delete("/delete_sp")
+def delete_by_sp(sp_item_id: Optional[str] = Query(None),
+                 sp_file_id: Optional[str] = Query(None),
+                 version: Optional[str] = Query(None),
+                 etag: Optional[str] = Query(None)):
+    """
+    Delete all chunks for a SharePoint document identity. If version/etag is
+    supplied, only that version is removed; otherwise all versions are removed.
+    """
+    where: Dict[str, Any] = {}
+    if sp_item_id:
+        where["sp_item_id"] = sp_item_id
+    if sp_file_id:
+        where["sp_file_id"] = sp_file_id
+    if not where:
+        raise HTTPException(400, "Provide sp_item_id or sp_file_id")
+    if version:
+        where["version_label"] = version
+    if etag:
+        where["etag"] = etag
+    try:
+        collection.delete(where=where)
+        return {"ok": True, "where": where}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "where": where}
