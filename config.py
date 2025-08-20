@@ -14,8 +14,8 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", "/srv/rag/chroma")
 WATCH_DIR = os.getenv("WATCH_DIR", "/srv/rag/watched")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/srv/rag/uploads")
 COLLECTION = os.getenv("COLLECTION", "company_docs")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1400"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 Q_MAX = int(os.getenv("INGEST_QUEUE_MAX", "8"))
 
 # Model aliasing
