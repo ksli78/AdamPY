@@ -507,7 +507,7 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
                 "model": model_tag,
                 "messages": messages,
                 "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 300},
+                "options": {"temperature": 0.2, "num_predict": 1000},
                 "keep_alive": OLLAMA_KEEP_ALIVE  # keep the 8B resident
             },
             timeout=120
