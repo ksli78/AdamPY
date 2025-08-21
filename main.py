@@ -76,7 +76,7 @@ class NomicOnnxEmbedder:
         self.max_len = max_len or int(os.getenv("EMBED_MAX_LEN", "2048"))
 
         # CPU by default; switch to onnxruntime-gpu + CUDA providers if desired
-        providers = ["CPUExecutionProvider"]
+        providers = ort.get_available_providers()
         self.session = ort.InferenceSession(onnx_path, providers=providers)
 
         # Model I/O signatures
