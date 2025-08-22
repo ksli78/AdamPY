@@ -547,7 +547,7 @@ def rewrite_prompt(prompt: str) -> str:
             f"{OLLAMA_URL}/api/chat",
             json={
                 "model": "mistral-7b-instruct",
-                "messages": [{"role": "user", "content": f"Rewrite the following user query to be more precise and clear for a document QA system:\n\n{prompt}"}],
+                "messages": [{"role": "user", "content": f"Rewrite the following user query to be more precise and clear for a document QA system make sure the response is detailed:\n\n{prompt}"}],
                 "stream": False,
                 "options": {"temperature": 0.3},
                 "keep_alive": OLLAMA_KEEP_ALIVE
