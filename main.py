@@ -615,12 +615,14 @@ def query_api(body: QueryBody) -> QueryResponse:
             "score": h.get("score"),
             "snippet": (h.get("text") or "")[:400]
         })
-    return QueryResponse(
-        answer=answer,
-        sources=rich,
-        original_query=body.query,
-        rewritten_query=rewritten_query,
-    )
+
+    return rewritten_query
+    # return QueryResponse(
+    #     answer=answer,
+    #     sources=rich,
+    #     original_query=body.query,
+    #     rewritten_query=rewritten_query,
+    # )
 
 
 @app.post("/upload")
