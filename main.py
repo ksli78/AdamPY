@@ -539,6 +539,30 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
 
     return _dehedge(content)
 
+
+def rewrite_prompt(prompt: str) -> str:
+    """Use Mistral to rewrite vague prompts to clearer ones."""
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": "mistral-7b-instruct",
+                "messages": [{"role": "user", "content": f"Rewrite the following user query to be more precise and clear for a document QA system:\n\n{prompt}"}],
+                "stream": False,
+                "options": {"temperature": 0.3},
+                "keep_alive": OLLAMA_KEEP_ALIVE
+            },
+            timeout=30
+        )
+        if r.status_code == 200:
+            j = r.json()
+            return (j.get("message") or {}).get("content", "").strip() or prompt
+        else:
+            return prompt
+    except Exception as e:
+        print("Prompt rewrite failed:", e)
+        return prompt
+
 # ---- API models & endpoints ----
 class QueryBody(BaseModel):
     query: str
@@ -552,16 +576,25 @@ class QueryBody(BaseModel):
     owner: Optional[str] = None
 
 
-@app.post("/query")
-def query_api(body: QueryBody):
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]]
+    original_query: str
+    rewritten_query: str
+
+
+@app.post("/query", response_model=QueryResponse)
+def query_api(body: QueryBody) -> QueryResponse:
+    rewritten_query = rewrite_prompt(body.query)
+
     # Use filtered search if filters provided; else regular search
     if body.org or body.category or body.doc_code or body.owner:
-        hits = search_filtered(body.query, k=body.k,
+        hits = search_filtered(rewritten_query, k=body.k,
                                source=None, org=body.org, category=body.category,
                                doc_code=body.doc_code, owner=body.owner)
     else:
-        hits = search(body.query, k=body.k)
-    answer = ask_with_context(body.query, hits, chat_history=body.history, model=body.model)
+        hits = search(rewritten_query, k=body.k)
+    answer = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
     used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()})
     filtered = [hits[i-1] for i in used if 1 <= i <= len(hits)] if used else []
     # Return richer source objects (non-breaking for existing clients)
@@ -581,7 +614,12 @@ def query_api(body: QueryBody):
             "score": h.get("score"),
             "snippet": (h.get("text") or "")[:400]
         })
-    return {"answer": answer, "sources": rich}
+    return QueryResponse(
+        answer=answer,
+        sources=rich,
+        original_query=body.query,
+        rewritten_query=rewritten_query,
+    )
 
 
 @app.post("/upload")
