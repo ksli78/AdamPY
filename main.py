@@ -539,26 +539,45 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
 
     return _dehedge(content)
 
-
 def rewrite_prompt(prompt: str) -> str:
-    """Use Mistral to rewrite vague prompts to clearer ones."""
+    """Use Mistral to safely rewrite vague prompts, without changing intent."""
     try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant that rewrites vague document questions into clearer, more precise ones "
+                    "without changing their meaning. Do NOT guess or introduce new topics. "
+                    "Only rewrite if the original query is unclear or incomplete."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Original query: {prompt}\n\nRewritten query:"
+            }
+        ]
+
         r = requests.post(
             f"{OLLAMA_URL}/api/chat",
             json={
                 "model": "mistral-7b-instruct",
-                "messages": [{"role": "user", "content": f"Rewrite the following user query to be more precise and clear for a document QA system make sure the response is detailed:\n\n{prompt}"}],
+                "messages": messages,
                 "stream": False,
-                "options": {"temperature": 0.2},
+                "options": {"temperature": 0.3},
                 "keep_alive": OLLAMA_KEEP_ALIVE
             },
             timeout=30
         )
+
         if r.status_code == 200:
             j = r.json()
-            return (j.get("message") or {}).get("content", "").strip() or prompt
-        else:
-            return prompt
+            rewritten = (j.get("message") or {}).get("content", "").strip()
+
+            # Basic sanity check: don't allow rewrites that lose all original keywords
+            if rewritten and any(word.lower() in rewritten.lower() for word in prompt.split()):
+                return rewritten
+
+        return prompt  # fallback if empty or invalid rewrite
     except Exception as e:
         print("Prompt rewrite failed:", e)
         return prompt
