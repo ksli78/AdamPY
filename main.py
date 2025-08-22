@@ -586,7 +586,12 @@ class QueryResponse(BaseModel):
 
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
-    rewritten_query = rewrite_prompt(body.query)
+    rewritten_query_raw = rewrite_prompt(body.query).strip()
+    m = re.search(r"Rewritten Query:\s*(.*)", rewritten_query_raw, re.DOTALL)
+    if m:
+        rewritten_query = m.group(1).strip()
+    else:
+        rewritten_query = next((ln.strip() for ln in rewritten_query_raw.splitlines() if ln.strip()), body.query)
 
     # Use filtered search if filters provided; else regular search
     if body.org or body.category or body.doc_code or body.owner:
@@ -615,14 +620,12 @@ def query_api(body: QueryBody) -> QueryResponse:
             "score": h.get("score"),
             "snippet": (h.get("text") or "")[:400]
         })
-
-    return rewritten_query
-    # return QueryResponse(
-    #     answer=answer,
-    #     sources=rich,
-    #     original_query=body.query,
-    #     rewritten_query=rewritten_query,
-    # )
+    return QueryResponse(
+        answer=answer,
+        sources=rich,
+        original_query=body.query,
+        rewritten_query=rewritten_query,
+    )
 
 
 @app.post("/upload")
