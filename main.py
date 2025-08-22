@@ -576,8 +576,16 @@ class QueryBody(BaseModel):
     owner: Optional[str] = None
 
 
-@app.post("/query")
-def query_api(body: QueryBody):
+class QueryResponse(BaseModel):
+    """Response schema for the /query endpoint."""
+    answer: str
+    sources: List[Dict[str, Any]]
+    original_query: str
+    rewritten_query: str
+
+
+@app.post("/query", response_model=QueryResponse)
+def query_api(body: QueryBody) -> QueryResponse:
     rewritten_query = rewrite_prompt(body.query)
 
     # Use filtered search if filters provided; else regular search
@@ -607,12 +615,12 @@ def query_api(body: QueryBody):
             "score": h.get("score"),
             "snippet": (h.get("text") or "")[:400]
         })
-    return {
-        "answer": answer,
-        "sources": rich,
-        "original_query": body.query,
-        "rewritten_query": rewritten_query,
-    }
+    return QueryResponse(
+        answer=answer,
+        sources=rich,
+        original_query=body.query,
+        rewritten_query=rewritten_query,
+    )
 
 
 @app.post("/upload")
