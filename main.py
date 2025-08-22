@@ -549,7 +549,7 @@ def rewrite_prompt(prompt: str) -> str:
                 "model": "mistral-7b-instruct",
                 "messages": [{"role": "user", "content": f"Rewrite the following user query to be more precise and clear for a document QA system make sure the response is detailed:\n\n{prompt}"}],
                 "stream": False,
-                "options": {"temperature": 0.3},
+                "options": {"temperature": 0.2},
                 "keep_alive": OLLAMA_KEEP_ALIVE
             },
             timeout=30
