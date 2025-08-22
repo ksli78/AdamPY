@@ -656,6 +656,7 @@ class QueryBody(BaseModel):
     category: Optional[str] = None
     doc_code: Optional[str] = None
     owner: Optional[str] = None
+    rewrite: bool = True
 
 
 class QueryResponse(BaseModel):
@@ -664,16 +665,25 @@ class QueryResponse(BaseModel):
     sources: List[Dict[str, Any]]
     original_query: str
     rewritten_query: str
+    prompt_rewritten: bool
 
 
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
-    rewritten_query_raw = rewrite_prompt(body.query).strip()
-    m = re.search(r"Rewritten Query:\s*(.*)", rewritten_query_raw, re.DOTALL)
-    if m:
-        rewritten_query = m.group(1).strip()
+    if body.rewrite:
+        rewritten_query_raw = rewrite_prompt(body.query).strip()
+        m = re.search(r"Rewritten Query:\s*(.*)", rewritten_query_raw, re.DOTALL)
+        if m:
+            rewritten_query = m.group(1).strip()
+        else:
+            rewritten_query = next(
+                (ln.strip() for ln in rewritten_query_raw.splitlines() if ln.strip()),
+                body.query,
+            )
+        prompt_rewritten = rewritten_query != body.query
     else:
-        rewritten_query = next((ln.strip() for ln in rewritten_query_raw.splitlines() if ln.strip()), body.query)
+        rewritten_query = body.query
+        prompt_rewritten = False
 
     # Use filtered search if filters provided; else regular search
     if body.org or body.category or body.doc_code or body.owner:
@@ -708,6 +718,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         sources=rich,
         original_query=body.query,
         rewritten_query=rewritten_query,
+        prompt_rewritten=prompt_rewritten,
     )
 
 
