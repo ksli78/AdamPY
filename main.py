@@ -462,6 +462,50 @@ def search(query: str, k: int = 4) -> List[Dict[str, Any]]:
             for d, m, dist in zip(docs, metas, dists)]
 
 
+def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rerank retrieved chunks using Mistral based on relevance to the question."""
+    if not chunks:
+        return []
+    top = chunks[:10]
+    prompt_lines = [
+        f"Given the question: {question}",
+        "Rank the following snippets in order of relevance to the question.",
+        "Respond with a comma-separated list of snippet numbers in ranked order.",
+        "Snippets:"
+    ]
+    snippet_lines = []
+    for i, ch in enumerate(top, 1):
+        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
+        snippet_lines.append(f"{i}. {snippet}")
+    user_prompt = "\n".join(prompt_lines + snippet_lines)
+
+    messages = [
+        {"role": "system", "content": "You rank text snippets by relevance."},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": "mistral-7b-instruct",
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0},
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
+            timeout=60,
+        )
+        if r.status_code == 200:
+            text = (r.json().get("message") or {}).get("content", "")
+            order = [int(n) for n in re.findall(r"\d+", text) if 1 <= int(n) <= len(top)]
+            ranked = [top[i - 1] for i in order if 1 <= i <= len(top)]
+            ranked += [top[i] for i in range(len(top)) if (i + 1) not in order]
+            return ranked[:5]
+    except Exception as e:
+        print("Rerank failed:", e)
+    return top[:5]
+
+
 def _dehedge(text: str) -> str:
     patterns = [
         r'(?i)^\s*(according to|based on|from)\s+(the\s+)?(provided|given)\s+(context|information|documents)\s*[:,\-]*\s*',
@@ -507,7 +551,7 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
                 "model": model_tag,
                 "messages": messages,
                 "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 1000},
+                "options": {"temperature": 0.2, "num_predict": 1024, "top_p": 0.95},
                 "keep_alive": OLLAMA_KEEP_ALIVE  # keep the 8B resident
             },
             timeout=120
@@ -538,6 +582,25 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
             return f'It says: "{{ " ".join(top.split()) }}" [1].'
 
     return _dehedge(content)
+
+
+def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return only chunks whose text shares keywords with the answer and are cited."""
+    if not answer or not chunks:
+        return []
+    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()}
+    if not used:
+        return []
+    answer_words = set(re.findall(r"\b\w{4,}\b", answer.lower()))
+    filtered = []
+    for ch in chunks:
+        idx = ch.get("index")
+        if idx not in used:
+            continue
+        snippet_words = set(re.findall(r"\b\w{4,}\b", (ch.get("text") or "").lower()))
+        if len(answer_words & snippet_words) >= 3:
+            filtered.append(ch)
+    return filtered
 
 def rewrite_prompt(prompt: str) -> str:
     """Use Mistral to safely rewrite vague prompts, without changing intent."""
@@ -614,20 +677,21 @@ def query_api(body: QueryBody) -> QueryResponse:
 
     # Use filtered search if filters provided; else regular search
     if body.org or body.category or body.doc_code or body.owner:
-        hits = search_filtered(rewritten_query, k=body.k,
+        hits = search_filtered(rewritten_query, k=10,
                                source=None, org=body.org, category=body.category,
                                doc_code=body.doc_code, owner=body.owner)
     else:
-        hits = search(rewritten_query, k=body.k)
+        hits = search(rewritten_query, k=10)
+    hits = rerank_sources(rewritten_query, hits)
+    for idx, h in enumerate(hits, 1):
+        h["index"] = idx
     answer = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
-    used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()})
-    filtered = [hits[i-1] for i in used if 1 <= i <= len(hits)] if used else []
-    # Return richer source objects (non-breaking for existing clients)
+    relevant = filter_cited_sources(answer, hits)
     rich = []
-    for i, h in enumerate(hits):
+    for h in relevant:
         meta = h.get("meta", {}) or {}
         rich.append({
-            "index": i+1,
+            "index": h.get("index"),
             "title": meta.get("title"),
             "org": meta.get("org"),
             "category": meta.get("category"),
@@ -637,7 +701,7 @@ def query_api(body: QueryBody) -> QueryResponse:
             "sp_web_url": meta.get("sp_web_url"),
             "path": meta.get("path"),   # present for legacy local docs
             "score": h.get("score"),
-            "snippet": (h.get("text") or "")[:400]
+            "snippet": (h.get("text") or "")[:400],
         })
     return QueryResponse(
         answer=answer,
@@ -959,12 +1023,13 @@ def query_path(body: Dict[str, Any] = Body(...)):
     doc_code = body.get("doc_code")
     owner = body.get("owner")
 
-    hits = search_filtered(query, k=k, path=path, paths=paths, prefix=prefix, source=source,
+    hits = search_filtered(query, k=10, path=path, paths=paths, prefix=prefix, source=source,
                            org=org, category=category, doc_code=doc_code, owner=owner)
+    hits = rerank_sources(query, hits)
+    for idx, h in enumerate(hits, 1):
+        h["index"] = idx
     answer = ask_with_context(query, hits, chat_history=history, model=model)
-
-    used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()})
-    filtered = [hits[i-1] for i in used if 1 <= i <= len(hits)] if used else []
+    filtered = filter_cited_sources(answer, hits)
     return {"answer": answer, "sources": filtered}
 
 
