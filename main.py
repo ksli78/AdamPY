@@ -1265,7 +1265,7 @@ def ingest_document_api(body: IngestDocument):
             "sp_web_url": body.sp_web_url,
             "etag": body.etag,
             "version_label": body.version_label,
-
+            "summary" : "",
             "title": body.title,
             "doc_code": body.doc_code,
             "org_code": body.org_code,
