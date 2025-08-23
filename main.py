@@ -675,15 +675,16 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
             dc = str(doc_code).lower()
             for qc in query_codes:
                 if dc == qc:
-                    ch["score"] *= 2.0
+                    ch["score"] *= 3.0
                     break
                 norm_dc = dc.replace("-", "")
                 norm_qc = qc.replace("-", "")
                 if norm_dc == norm_qc or difflib.SequenceMatcher(None, norm_dc, norm_qc).ratio() >= 0.9:
-                    ch["score"] *= 1.5
+                    ch["score"] *= 2.0
                     break
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
+    pre_llm = [dict(ch) for ch in chunks]
 
     snippet_lines = []
     for i, ch in enumerate(chunks, 1):
@@ -716,21 +717,35 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
         if r.status_code == 200:
             text = (r.json().get("message") or {}).get("content", "")
             pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
-            for idx_s, score_s in pairs:
-                idx = int(idx_s)
-                if 1 <= idx <= len(chunks):
-                    chunks[idx - 1]["score"] = float(score_s)
-            for ch in chunks:
-                ch.setdefault("score", 0.0)
-            chunks.sort(key=lambda x: x["score"], reverse=True)
-            filtered = [ch for ch in chunks if ch["score"] >= 1.5][:3]
+            if pairs:
+                for idx_s, score_s in pairs:
+                    idx = int(idx_s)
+                    if 1 <= idx <= len(chunks):
+                        chunks[idx - 1]["score"] = float(score_s)
+                for ch in chunks:
+                    ch.setdefault("score", 0.0)
+                chunks.sort(key=lambda x: x["score"], reverse=True)
+            else:
+                order = [int(n) for n in re.findall(r"\d+", text)
+                         if 1 <= int(n) <= len(chunks)]
+                if order:
+                    for rank, idx in enumerate(order):
+                        chunks[idx - 1]["score"] = float(len(order) - rank)
+                    for ch in chunks:
+                        ch.setdefault("score", 0.0)
+                    chunks.sort(key=lambda x: x["score"], reverse=True)
+                else:
+                    print("Could not parse reranker output, using pre-LLM order")
+                    return pre_llm[:3]
+
+            filtered = [ch for ch in chunks if ch["score"] >= 1.0][:3]
             if not filtered:
-                print("All reranked scores below threshold")
-                return []
+                print("All reranked scores below threshold; using pre-LLM order")
+                return pre_llm[:3]
             return filtered
     except Exception as e:
         print("Hybrid rerank failed:", e)
-    return chunks[:3]
+    return pre_llm[:3]
 
 
 
@@ -816,7 +831,9 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
         "Answer directly and succinctly. Do not start with phrases like "
         "'According to the provided context'. Use ONLY the provided context for factual claims and insert "
         "inline bracket citations like [1], [2] right after the sentence they support. "
-        "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know."
+        "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know. "
+        "Do not fabricate citations. Only use numbers [1], [2], … that correspond to the context blocks. "
+        "If you cannot support a claim with a citation, say you do not know."
     )
     if force_citations:
         sys_prompt += " You MUST include at least one citation if you answer. If unsure, say you do not know."
@@ -870,26 +887,24 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
 
 
 def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return only chunks whose text shares keywords with the answer and are cited."""
+    """Return chunks that are explicitly cited in the answer."""
     if not answer or not chunks:
         return []
     used = {int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()}
     if not used:
         return []
-    answer_words = set(re.findall(r"\b\w{4,}\b", answer.lower()))
-    filtered = []
+    ordered = []
     for ch in chunks:
-        idx = ch.get("index")
-        if idx not in used:
-            continue
-        snippet_words = set(re.findall(r"\b\w{4,}\b", (ch.get("text") or "").lower()))
-        if len(answer_words & snippet_words) >= 3:
-            filtered.append(ch)
-    return filtered
+        if ch.get("index") in used:
+            ordered.append(ch)
+    return ordered
 
 def rewrite_prompt(prompt: str) -> str:
     """Use Mistral to safely rewrite vague prompts, without changing intent."""
     try:
+        code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+        codes = code_pat.findall(prompt)
+
         messages = [
             {
                 "role": "system",
@@ -901,7 +916,7 @@ def rewrite_prompt(prompt: str) -> str:
             },
             {
                 "role": "user",
-                "content": f"Original query: {prompt}\n\nRewritten query:"
+                "content": f"Original query: {prompt}\n\nRewritten query:",
             }
         ]
 
@@ -920,10 +935,12 @@ def rewrite_prompt(prompt: str) -> str:
         if r.status_code == 200:
             j = r.json()
             rewritten = (j.get("message") or {}).get("content", "").strip()
-
-            # Basic sanity check: don't allow rewrites that lose all original keywords
-            if rewritten and any(word.lower() in rewritten.lower() for word in prompt.split()):
-                return rewritten
+            if rewritten:
+                for c in codes:
+                    if c not in rewritten:
+                        rewritten = (rewritten + " " + c).strip()
+                if not codes or all(c in rewritten for c in codes):
+                    return rewritten
 
         return prompt  # fallback if empty or invalid rewrite
     except Exception as e:
@@ -990,7 +1007,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         if body.owner:
             where["owner"] = body.owner
 
-    hits = hybrid_rerank(rewritten_query, retriever, "llama3:8b", where=where)
+    hits = hybrid_rerank(rewritten_query, retriever, "mistral-7b-instruct", where=where)
     if not hits:
         return QueryResponse(
             answer="I'm sorry, I couldn't find relevant information.",
@@ -1011,13 +1028,17 @@ def query_api(body: QueryBody) -> QueryResponse:
         if filtered:
             answer = second
         else:
-            return QueryResponse(
-                answer="I'm sorry, I can't answer confidently from the provided sources.",
-                sources=[],
-                original_query=body.query,
-                rewritten_query=rewritten_query,
-                prompt_rewritten=prompt_rewritten,
-            )
+            if re.search(r"\[(\d+)\]", second):
+                answer = second
+                filtered = []
+            else:
+                return QueryResponse(
+                    answer="I'm sorry, I can't answer confidently from the provided sources.",
+                    sources=[],
+                    original_query=body.query,
+                    rewritten_query=rewritten_query,
+                    prompt_rewritten=prompt_rewritten,
+                )
 
     rich = []
     for h in filtered:
