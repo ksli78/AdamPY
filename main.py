@@ -519,16 +519,13 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
     embs = embed(chunks)
     ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
     base_meta = dict(base_meta)
-    # Preserve existing metadata fields and add classification info
-    base_meta.update({"category": category, "keywords": keywords})
+    # Preserve existing metadata fields and add classification info, including summary
+    base_meta.update({"summary": summary, "category": category, "keywords": keywords})
     metas = []
     for i in range(len(chunks)):
         m = _sanitize_metadata(dict(base_meta))
         m["doc_id"] = doc_id
         m["chunk"] = i
-        # Ensure the generated summary is stored with the document metadata
-        if i == 0:
-            m["summary"] = summary
         metas.append(m)
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
