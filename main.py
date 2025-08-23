@@ -415,10 +415,9 @@ def clean_document_text(text: str) -> str:
 def summarize_document(text: str) -> Tuple[str, str, List[str]]:
     """Use a local LLM to summarize and classify the document."""
     prompt = (
-        "Summarize the following document in one paragraph, "
-        "assign a category such as HR, Legal, Compliance, Finance, etc., "
-        "and provide 5-10 keywords as a JSON list. Return ONLY JSON with "
-        "keys summary, category, keywords. Document:\n" + text[:4000]
+        "Please summarize the following document. "
+        "Return only JSON in this format: {\"summary\": \"...\", \"category\": \"...\", \"keywords\": [\"...\"]}. "
+        "Document:\n" + text[:4000]
     )
 
     summary, category, keywords = "", "", []
@@ -446,68 +445,46 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\n", "", content)
                 content = re.sub(r"\n```$", "", content)
-            # extract JSON object if extra text is returned
-            match = re.search(r"{[\s\S]*}", content)
-            if match:
-                content = match.group(0)
 
+            data = None
             try:
                 data = json.loads(content)
-                summary = data.get("summary", "").strip()
-                category = data.get("category", "").strip()
-                kw = data.get("keywords", [])
-                if isinstance(kw, str):
-                    keywords = [k.strip() for k in re.split(r'[ ,\n]+', kw) if k.strip()]
-                elif isinstance(kw, list):
-                    keywords = [str(k).strip() for k in kw if str(k).strip()]
-                else:
-                    keywords = []
+            except Exception:
+                match = re.search(r"{[\s\S]*}", content)
+                if match:
+                    try:
+                        data = json.loads(match.group(0))
+                    except Exception:
+                        pass
+
+            if not isinstance(data, dict):
+                print(f"Warning: unable to parse LLM JSON output. Raw content: {content}")
                 print("Parsed summary:", summary)
                 print("Parsed category:", category)
                 print("Parsed keywords:", keywords)
                 return summary, category, keywords
-            except Exception as e:
-                print(f"Warning: JSON parse failed for LLM output: {e}. Content: {content}")
 
-                summary_match = re.search(
-                    r"(?i)summary\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
-                )
-                if summary_match:
-                    summary = summary_match.group(1).strip()
-
-                category_match = re.search(
-                    r"(?i)category\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
-                )
-                if category_match:
-                    category = category_match.group(1).strip()
-
-                keywords_match = re.search(
-                    r"(?i)keywords?\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
-                )
-                if keywords_match:
-                    kw_text = keywords_match.group(1).strip()
-                    try:
-                        kw = json.loads(kw_text)
-                        if isinstance(kw, list):
-                            keywords = [str(k).strip() for k in kw if str(k).strip()]
-                        else:
-                            keywords = [str(kw).strip()]
-                    except Exception:
-                        keywords = [
-                            k.strip()
-                            for k in re.split(r'[ ,;\n]+', kw_text)
-                            if k.strip()
-                        ]
-
-                print("Regex parsed summary:", summary)
-                print("Regex parsed category:", category)
-                print("Regex parsed keywords:", keywords)
-                return summary, category, keywords
+            summary = str(data.get("summary", "") or "").strip()
+            category = str(data.get("category", "") or "").strip()
+            kw = data.get("keywords", [])
+            if isinstance(kw, str):
+                keywords = [k.strip() for k in re.split(r"[ ,\n]+", kw) if k.strip()]
+            elif isinstance(kw, list):
+                keywords = [str(k).strip() for k in kw if str(k).strip()]
+            else:
+                keywords = []
+            print("Parsed summary:", summary)
+            print("Parsed category:", category)
+            print("Parsed keywords:", keywords)
+            return summary, category, keywords
         else:
             print(f"Warning: summarize_document HTTP {r.status_code}: {r.text}")
     except Exception as e:
         print(f"Warning: summarize_document request failed: {e}")
 
+    print("Parsed summary:", summary)
+    print("Parsed category:", category)
+    print("Parsed keywords:", keywords)
     return summary, category, keywords
 
 
