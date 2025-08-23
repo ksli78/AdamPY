@@ -47,6 +47,7 @@ import openpyxl
 import extract_msg
 
 import traceback
+import difflib
 
 # ---------------- Embeddings: nomic-embed-text via ONNXRuntime ----------------
 import onnxruntime as ort
@@ -619,6 +620,46 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
               for d, m, dist in zip(docs, metas, dists)]
     if not chunks:
         return []
+
+    # --- Metadata-aware boosting ---
+    def _tokens(s: str) -> List[str]:
+        return re.findall(r"\b\w+\b", (s or "").lower())
+
+    q_tokens = set(_tokens(query))
+    for ch in chunks:
+        meta = ch.get("meta") or {}
+        fields = []
+        cat = meta.get("category")
+        if cat:
+            fields.append(cat)
+        title = meta.get("title")
+        if title:
+            fields.append(title)
+        kws = meta.get("keywords")
+        if kws:
+            if isinstance(kws, list):
+                fields.extend(kws)
+            else:
+                fields.append(kws)
+
+        meta_tokens = set()
+        for f in fields:
+            meta_tokens.update(_tokens(str(f)))
+
+        matches = 0
+        for qt in q_tokens:
+            if qt in meta_tokens:
+                matches += 1
+            else:
+                for mt in meta_tokens:
+                    if difflib.SequenceMatcher(None, qt, mt).ratio() >= 0.8:
+                        matches += 1
+                        break
+
+        if matches:
+            ch["score"] *= 1 + 0.1 * matches
+
+    chunks.sort(key=lambda x: x["score"], reverse=True)
 
     snippet_lines = []
     for i, ch in enumerate(chunks, 1):
