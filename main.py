@@ -508,7 +508,6 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
     if len(text) < 500:
         raise ValueError("document under 500 characters after cleanup")
 
-    summary, category, keywords = summarize_document(text)
     try:
         collection.delete(where={"doc_id": doc_id})
     except Exception:
@@ -519,8 +518,6 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
     embs = embed(chunks)
     ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
     base_meta = dict(base_meta)
-    # Preserve existing metadata fields and add classification info, including summary
-    base_meta.update({"summary": summary, "category": category, "keywords": keywords})
     metas = []
     for i in range(len(chunks)):
         m = _sanitize_metadata(dict(base_meta))
@@ -1289,10 +1286,13 @@ def ingest_document_api(body: IngestDocument):
 
         # 1) If text provided, use directly (fastest)
         if body.text_content and str(body.text_content).strip():
-            try:
-                n = upsert_text(doc_id, body.text_content, base_meta)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            text = clean_document_text(body.text_content)
+            if len(text) < 500:
+                raise HTTPException(status_code=400, detail="document under 500 characters after cleanup")
+            summary, category, keywords = summarize_document(text)
+            meta = dict(base_meta)
+            meta.update({"summary": summary, "category": category, "keywords": keywords})
+            n = upsert_text(doc_id, text, meta)
             return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content"}
 
         # 2) Else parse from base64 content bytes ephemerally
@@ -1310,10 +1310,13 @@ def ingest_document_api(body: IngestDocument):
                 except TypeError:
                     if tmp.exists():
                         tmp.unlink()
-            try:
-                n = upsert_text(doc_id, text, base_meta)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            text = clean_document_text(text)
+            if len(text) < 500:
+                raise HTTPException(status_code=400, detail="document under 500 characters after cleanup")
+            summary, category, keywords = summarize_document(text)
+            meta = dict(base_meta)
+            meta.update({"summary": summary, "category": category, "keywords": keywords})
+            n = upsert_text(doc_id, text, meta)
             return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "content_bytes"}
 
         raise HTTPException(status_code=400, detail="Provide either text_content or content_bytes.")
