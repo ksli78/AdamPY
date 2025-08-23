@@ -177,7 +177,7 @@ ALIAS_MAP = {
     "Adam Lite": "adam-lite:latest",
     "adam-lite": "adam-lite:latest",
     "llama3:8b": "llama3:8b",
-    "mistral-7b-instruct": "mistral:7b-instruct",
+    "mistral-7b-instruct": "mistral-7b-instruct:latest",
 }
 DEFAULT_MODEL = CHAT_MODEL
 
