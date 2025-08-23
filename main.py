@@ -213,6 +213,7 @@ app.add_middleware(
 
 client = chromadb.PersistentClient(path=CHROMA_DIR)
 collection = client.get_or_create_collection(COLLECTION)
+retriever = collection
 
 # ---------------- Helpers ----------------
 SUPPORTED = (
@@ -462,6 +463,61 @@ def search(query: str, k: int = 4) -> List[Dict[str, Any]]:
             for d, m, dist in zip(docs, metas, dists)]
 
 
+def hybrid_rerank(query: str, retriever, reranker_model_name: str,
+                  initial_k: int = 15, final_k: int = 5,
+                  where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Retrieve top N chunks via Chroma then rerank them with an LLM."""
+    qemb = embed([query])[0]
+    res = retriever.query(query_embeddings=[qemb], n_results=initial_k,
+                          include=["documents", "metadatas", "distances"],
+                          where=where or {})
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
+    chunks = [{"text": d, "meta": m, "score": float(1.0 / (1e-5 + dist))}
+              for d, m, dist in zip(docs, metas, dists)]
+    if not chunks:
+        return []
+
+    snippet_lines = []
+    for i, ch in enumerate(chunks, 1):
+        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
+        snippet_lines.append(f"{i}. {snippet}")
+
+    user_prompt = (
+        f"Query: {query}\n\n" +
+        "\n".join(snippet_lines) +
+        "\n\nReturn the numbers of the five most relevant chunks in order, comma-separated."
+    )
+
+    messages = [
+        {"role": "system", "content": "You rank chunks by relevance."},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": reranker_model_name,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0},
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
+            timeout=60,
+        )
+        if r.status_code == 200:
+            text = (r.json().get("message") or {}).get("content", "")
+            order = [int(n) for n in re.findall(r"\d+", text) if 1 <= int(n) <= len(chunks)]
+            ranked = [chunks[i - 1] for i in order if 1 <= i <= len(chunks)]
+            ranked += [chunks[i] for i in range(len(chunks)) if (i + 1) not in order]
+            return ranked[:final_k]
+    except Exception as e:
+        print("Hybrid rerank failed:", e)
+    return chunks[:final_k]
+
+
 def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rerank retrieved chunks using Mistral based on relevance to the question."""
     if not chunks:
@@ -685,20 +741,26 @@ def query_api(body: QueryBody) -> QueryResponse:
         rewritten_query = body.query
         prompt_rewritten = False
 
-    # Use filtered search if filters provided; else regular search
+    where: Optional[Dict[str, Any]] = None
     if body.org or body.category or body.doc_code or body.owner:
-        hits = search_filtered(rewritten_query, k=10,
-                               source=None, org=body.org, category=body.category,
-                               doc_code=body.doc_code, owner=body.owner)
-    else:
-        hits = search(rewritten_query, k=10)
-    hits = rerank_sources(rewritten_query, hits)
+        where = {}
+        if body.org:
+            where["org"] = body.org
+        if body.category:
+            where["category"] = body.category
+        if body.doc_code:
+            where["doc_code"] = body.doc_code
+        if body.owner:
+            where["owner"] = body.owner
+
+    hits = hybrid_rerank(rewritten_query, retriever, "llama3:8b", where=where)
     for idx, h in enumerate(hits, 1):
         h["index"] = idx
+
     answer = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
-    relevant = filter_cited_sources(answer, hits)
+
     rich = []
-    for h in relevant:
+    for h in hits:
         meta = h.get("meta", {}) or {}
         rich.append({
             "index": h.get("index"),
@@ -713,6 +775,7 @@ def query_api(body: QueryBody) -> QueryResponse:
             "score": h.get("score"),
             "snippet": (h.get("text") or "")[:400],
         })
+
     return QueryResponse(
         answer=answer,
         sources=rich,
