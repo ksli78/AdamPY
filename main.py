@@ -6,6 +6,7 @@ sys.modules["sqlite3"] = pysqlite3
 sys.modules["sqlite3.dbapi2"] = pysqlite3.dbapi2
 
 import os
+import json
 import re
 import uuid
 import time
@@ -61,6 +62,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def summarize_document(text_content):
+    prompt = f"""
+    Summarize the following document content and extract metadata. 
+    Respond only with JSON using this exact format:
+
+    {{
+      "summary": "<brief summary of the content>",
+      "category": "<one or two word category>",
+      "keywords": ["<keyword1>", "<keyword2>", ...]
+    }}
+
+    Document:
+    {text_content}
+
+    Only respond with valid JSON. Do not include any explanatory text or commentary.
+    """
+
+    raw_content = call_llm(prompt)
+    print("LLM raw content:", raw_content)
+
+    # Try full JSON parse
+    try:
+        data = json.loads(raw_content)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*?\}', raw_content, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except:
+                print("Still failed to parse trimmed JSON.")
+                data = {}
+        else:
+            print("Regex match for JSON failed.")
+            data = {}
+
+    summary = data.get("summary", "").strip()
+    category = data.get("category", "").strip()
+    keywords = data.get("keywords", []) if isinstance(data.get("keywords", []), list) else []
+
+    print(f"Parsed summary: {summary}")
+    print(f"Parsed category: {category}")
+    print(f"Parsed keywords: {keywords}")
+
+    return summary, category, keywords
 
 
 # ---------------- API Endpoints ----------------
