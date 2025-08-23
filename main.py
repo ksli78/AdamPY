@@ -966,9 +966,8 @@ def list_documents():
                 "doc_id": results["ids"][i],
                 "metadata": meta,
             }
-            # Surface the summary if it was stored during ingest
-            if "summary" in meta:
-                doc_info["summary"] = meta["summary"]
+         
+         
             docs.append(doc_info)
 
         return JSONResponse(content={"documents": docs, "count": len(docs)})
@@ -1293,7 +1292,7 @@ def ingest_document_api(body: IngestDocument):
             meta = dict(base_meta)
             meta.update({"summary": summary, "category": category, "keywords": keywords})
             n = upsert_text(doc_id, text, meta)
-            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content"}
+            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content", "summary":summary}
 
         # 2) Else parse from base64 content bytes ephemerally
         if body.content_bytes:
