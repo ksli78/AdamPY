@@ -573,12 +573,34 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
         return 0
     embs = embed(chunks)
     ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
-    base_meta = dict(base_meta)
+
+    # Ensure LLM metadata fields are strings / JSON-serializable
+    meta = dict(base_meta or {})
+    summary = meta.get("summary", "")
+    category = meta.get("category", "")
+    keywords = meta.get("keywords", [])
+
+    if not isinstance(summary, str):
+        try:
+            summary = json.dumps(summary, ensure_ascii=False)
+        except Exception:
+            summary = str(summary)
+    if not isinstance(category, str):
+        category = str(category)
+    if not isinstance(keywords, str):
+        try:
+            keywords = json.dumps(keywords, ensure_ascii=False)
+        except Exception:
+            keywords = str(keywords)
+
+    meta.update({"summary": summary, "category": category, "keywords": keywords})
+
     metas = []
     for i in range(len(chunks)):
-        m = _sanitize_metadata(dict(base_meta))
+        m = dict(meta)
         m["doc_id"] = doc_id
         m["chunk"] = i
+        m = _sanitize_metadata(m)
         metas.append(m)
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
