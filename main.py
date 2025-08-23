@@ -437,6 +437,7 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
         if r.status_code == 200:
             try:
                 content = (r.json().get("message") or {}).get("content", "").strip()
+                print("LLM raw content:", content)
             except Exception as e:
                 print(f"Warning: unable to read LLM response: {e}")
                 return summary, category, keywords
@@ -461,6 +462,9 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
                     keywords = [str(k).strip() for k in kw if str(k).strip()]
                 else:
                     keywords = []
+                print("Parsed summary:", summary)
+                print("Parsed category:", category)
+                print("Parsed keywords:", keywords)
                 return summary, category, keywords
             except Exception as e:
                 print(f"Warning: JSON parse failed for LLM output: {e}. Content: {content}")
@@ -495,6 +499,9 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
                             if k.strip()
                         ]
 
+                print("Regex parsed summary:", summary)
+                print("Regex parsed category:", category)
+                print("Regex parsed keywords:", keywords)
                 return summary, category, keywords
         else:
             print(f"Warning: summarize_document HTTP {r.status_code}: {r.text}")
@@ -576,6 +583,10 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
 
     # Ensure LLM metadata fields are strings / JSON-serializable
     meta = dict(base_meta or {})
+    if not meta.get("summary") and not meta.get("category") and not meta.get("keywords"):
+        s, c, k = summarize_document(text)
+        meta.update({"summary": s, "category": c, "keywords": k})
+
     summary = meta.get("summary", "")
     category = meta.get("category", "")
     keywords = meta.get("keywords", [])
@@ -594,6 +605,7 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
             keywords = str(keywords)
 
     meta.update({"summary": summary, "category": category, "keywords": keywords})
+    print(f"upsert_text metadata summary={summary!r}, category={category!r}, keywords={keywords}")
 
     metas = []
     for i in range(len(chunks)):
