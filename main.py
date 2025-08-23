@@ -444,12 +444,13 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
                 content = match.group(0)
             try:
                 data = json.loads(content)
+                
                 summary = data.get("summary", "").strip()
                 category = data.get("category", "").strip()
                 keywords = data.get("keywords", [])
                 if isinstance(keywords, str):
                     keywords = [k.strip() for k in re.split(r'[ ,\n]+', keywords) if k.strip()]
-                return summary, category, keywords
+                return summary, category, keywords 
             except Exception:
                 pass
     except Exception:
@@ -1297,7 +1298,7 @@ def ingest_document_api(body: IngestDocument):
             text = clean_document_text(body.text_content)
             if len(text) < 500:
                 raise HTTPException(status_code=400, detail="document under 500 characters after cleanup")
-            summary, category, keywords = summarize_document(text)
+            summary, category, keywords  = summarize_document(text)
             meta = dict(base_meta)
             meta.update({"summary": summary, "category": category, "keywords": keywords})
             n = upsert_text(doc_id, text, meta)
