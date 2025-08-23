@@ -21,7 +21,7 @@ import base64
 import tempfile
 from collections import deque
 from pathlib import Path as _Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 
 import requests
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Header
@@ -659,6 +659,7 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
     doc_boosts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, 1):
         meta = ch.get("meta") or {}
+        _ensure_doc_code(meta)
         fields = []
         cat = meta.get("category")
         if cat:
@@ -715,6 +716,11 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
                     doc_boosts.append({"index": idx, "reason": "fuzzy", "multiplier": 2.0})
                     boosted = True
                     break
+        if (meta.get("category") or "").lower() == "policy":
+            ch["score"] *= 1.15
+        t = (meta.get("title") or "").lower()
+        if any(k in t for k in ["workweek", "work week", "work hours", "timekeeping", "pto", "decisions tool"]):
+            ch["score"] *= 1.10
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
     pre_llm = [dict(ch) for ch in chunks]
@@ -934,7 +940,8 @@ def _dehedge(text: str) -> str:
     return text.strip()
 
 def ask_with_context(question: str, hits: List[dict], chat_history: Optional[List[dict]] = None,
-                     model: Optional[str] = None, force_citations: bool = False) -> str:
+                     model: Optional[str] = None, force_citations: bool = False,
+                     extra_system_prompt: str = "") -> str:
     ql = (question or "").lower()
 
     meta_triggers = [
@@ -953,11 +960,17 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
         "'According to the provided context'. Use ONLY the provided context for factual claims and insert "
         "inline bracket citations like [1], [2] right after the sentence they support. "
         "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know. "
-        "Do not fabricate citations. Only use numbers [1], [2], … that correspond to the context blocks. "
-        "If you cannot support a claim with a citation, say you do not know."
+        "CITATION RULES: Use only numeric bracket citations that correspond to the provided context blocks, e.g., [1], [2]. "
+        "Do not use section numbers like [4.1], ranges like [1-3], or textual citations. Put the citation immediately after each claim it supports. "
+        "COMPLETENESS RULES: If the user asks about definitions, boundaries, windows, or procedures, include all relevant elements present in the context (e.g., start and end times, total hours, tool/system names). "
+        "NO FABRICATION: If a claim cannot be supported with a bracket citation from the context, say you do not know. "
+        "OUTPUT FORMAT (HTML ONLY): Respond with a well-formed HTML fragment (not a full <html> page). Use <p> for paragraphs (each sentence starts with a capital letter). <ul> / <ol> with <li> for lists of steps or bullets. <table><thead>…</thead><tbody>…</tbody></table> for side-by-side facts. <strong>, <em>, <code>, <sup> as needed. CITATIONS: Put bracket citations inline at the end of the clause they support as <sup>[n]</sup>. Only use numbers that map to the provided context blocks. STYLE & SAFETY: Do not include <script>, inline CSS, external images, or arbitrary attributes. No markdown; HTML only. COMPLETENESS: For definition/boundary/steps questions, include all relevant elements present in the context (e.g., start and end times, total hours, and system/tool names). "
+        "Direct answer in one sentence. One short follow-up sentence with any missing critical detail (e.g., 'begins Friday 12:00 noon and ends next Friday 11:59 a.m.'). Include the bracket citations inline."
     )
     if force_citations:
         sys_prompt += " You MUST include at least one citation if you answer. If unsure, say you do not know."
+    if extra_system_prompt:
+        sys_prompt += " " + extra_system_prompt
 
     messages = [{"role": "system", "content": sys_prompt}]
     if chat_history:
@@ -1020,6 +1033,45 @@ def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict
             ordered.append(ch)
     return ordered
 
+
+def _extract_numeric_citations(answer: str, max_index: int) -> Tuple[Set[int], bool]:
+    brackets = re.findall(r"\[([^\]]+)\]", answer or "")
+    used: Set[int] = set()
+    valid = True
+    for b in brackets:
+        if not b.isdigit():
+            valid = False
+            continue
+        idx = int(b)
+        if idx < 1 or idx > max_index:
+            valid = False
+        else:
+            used.add(idx)
+    return used, valid
+
+
+def _ensure_html(text: str) -> Tuple[str, bool, List[str]]:
+    tags = [t.lower() for t in re.findall(r"<\s*([a-zA-Z0-9]+)", text or "")]
+    is_html = bool(tags)
+    if not any(t in ("p", "ul", "ol", "table") for t in tags):
+        t = (text or "").strip()
+        if t:
+            t = t[0].upper() + t[1:]
+        text = f"<p>{t}</p>"
+        tags = ["p"]
+        is_html = True
+    tag_summary = sorted({t for t in tags})
+    return text, is_html, tag_summary
+
+
+def _ensure_doc_code(meta: Dict[str, Any]) -> None:
+    if meta.get("doc_code"):
+        return
+    url = meta.get("sp_web_url") or meta.get("path") or ""
+    m = re.search(r"([A-Za-z]{2,}-[A-Za-z]{2,}-[A-Za-z]{2,}-\d{3,5})", url)
+    if m:
+        meta["doc_code"] = m.group(1)
+
 def rewrite_prompt(prompt: str) -> str:
     """Use Mistral to safely rewrite vague prompts, without changing intent."""
     try:
@@ -1060,6 +1112,13 @@ def rewrite_prompt(prompt: str) -> str:
                 for c in codes:
                     if c not in rewritten:
                         rewritten = (rewritten + " " + c).strip()
+                orig_lower = prompt.lower()
+                rew_lower = rewritten.lower()
+                keywords = ["workweek", "work week", "pto", "decisions tool", "timekeeping"]
+                for kw in keywords:
+                    if kw in orig_lower and kw not in rew_lower:
+                        rewritten = (rewritten + " " + kw).strip()
+                        rew_lower = rewritten.lower()
                 if not codes or all(c in rewritten for c in codes):
                     return rewritten
 
@@ -1093,9 +1152,9 @@ class QueryResponse(BaseModel):
 
 # Quick smoke tests:
 # curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
-#   -d '{"query": "What\u2019s the standard workweek and when does it start and end?"}'
+#   -d '{"query": "When does the standard workweek begin and end?"}'
 # curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
-#   -d '{"query": "Tell me about CLG-EN-PO-0301"}'
+#   -d '{"query": "Per CLG-EN-PO-0301, where do I submit PTO?"}'
 # curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
 #   -d '{"query": "What is the weather on Mars?"}'
 
@@ -1120,7 +1179,13 @@ def query_api(body: QueryBody) -> QueryResponse:
             "first_pass": {"answer": "", "citations": [], "timing_ms": 0},
             "second_pass_invoked": False,
             "second_pass": {"answer": "", "citations": [], "timing_ms": 0},
-            "final": {"answer_used": "", "filtered_sources": [], "fallback_reason": "none"},
+            "final": {
+                "answer_used": "",
+                "filtered_sources": [],
+                "fallback_reason": "none",
+                "answer_is_html": False,
+                "html_tag_summary": [],
+            },
         },
         "total_time_ms": 0,
     }
@@ -1161,10 +1226,13 @@ def query_api(body: QueryBody) -> QueryResponse:
     debug["retrieval"].update(rdebug)
     if not hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
+        final_answer, is_html_final, tags_final = _ensure_html(final_answer)
         debug["answering"]["final"].update({
             "answer_used": _truncate(final_answer, 1200),
             "filtered_sources": [],
             "fallback_reason": "no_hits_after_rerank",
+            "answer_is_html": is_html_final,
+            "html_tag_summary": tags_final,
         })
         debug["total_time_ms"] = _now_ms() - start_total
         with _debug_lock:
@@ -1182,50 +1250,73 @@ def query_api(body: QueryBody) -> QueryResponse:
     start_ans = _now_ms()
     answer_first = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
     ans_time = _now_ms() - start_ans
-    citations_first = [int(n) for n in re.findall(r"\[(\d+)\]", answer_first) if n.isdigit()]
+    answer_first, is_html_first, tags_first = _ensure_html(answer_first)
+    used_first, valid_first = _extract_numeric_citations(answer_first, len(hits))
+    citations_first = sorted(list(used_first))
     debug["answering"]["first_pass"] = {
         "answer": _truncate(answer_first, 1200),
         "citations": citations_first,
         "timing_ms": ans_time,
     }
-    filtered = filter_cited_sources(answer_first, hits)
+    filtered = filter_cited_sources(answer_first, hits) if valid_first and used_first else []
     answer_used = answer_first
-    if not filtered:
+    is_html_final = is_html_first
+    tags_final = tags_first
+    if not valid_first or not filtered:
         debug["answering"]["second_pass_invoked"] = True
+        extra = (
+            "Your previous answer used invalid citations (e.g., [4.1] or out-of-range). "
+            "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
+            "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
+            "Maintain completeness and sentence capitalization."
+        )
+        snippet_all = " ".join([h.get("text") or "" for h in hits])
+        if "12:00" in snippet_all and "11:59" in snippet_all:
+            extra += " Include both the start and end time and the total hours if mentioned."
         start_second = _now_ms()
-        second = ask_with_context(rewritten_query, hits, chat_history=body.history,
-                                  model=body.model, force_citations=True)
+        second = ask_with_context(
+            rewritten_query,
+            hits,
+            chat_history=body.history,
+            model=body.model,
+            force_citations=True,
+            extra_system_prompt=extra,
+        )
         second_ms = _now_ms() - start_second
-        citations_second = [int(n) for n in re.findall(r"\[(\d+)\]", second) if n.isdigit()]
+        second, is_html_second, tags_second = _ensure_html(second)
+        used_second, valid_second = _extract_numeric_citations(second, len(hits))
+        citations_second = sorted(list(used_second))
         debug["answering"]["second_pass"] = {
             "answer": _truncate(second, 1200),
             "citations": citations_second,
             "timing_ms": second_ms,
         }
-        filtered = filter_cited_sources(second, hits)
-        if filtered:
-            answer_used = second
-        else:
-            if re.search(r"\[(\d+)\]", second):
+        if valid_second and citations_second:
+            filtered = filter_cited_sources(second, hits)
+            if filtered:
                 answer_used = second
-                filtered = []
-            else:
-                final_answer = "I'm sorry, I can't answer confidently from the provided sources."
-                debug["answering"]["final"].update({
-                    "answer_used": _truncate(final_answer, 1200),
-                    "filtered_sources": [],
-                    "fallback_reason": "no_citations_after_second_pass",
-                })
-                debug["total_time_ms"] = _now_ms() - start_total
-                with _debug_lock:
-                    _debug_buffer.append(debug)
-                return QueryResponse(
-                    answer=final_answer,
-                    sources=[],
-                    original_query=body.query,
-                    rewritten_query=rewritten_query,
-                    prompt_rewritten=prompt_rewritten,
-                )
+                is_html_final = is_html_second
+                tags_final = tags_second
+        if not filtered:
+            final_answer = "I'm sorry, I can't answer confidently from the provided sources."
+            final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+            debug["answering"]["final"].update({
+                "answer_used": _truncate(final_answer, 1200),
+                "filtered_sources": [],
+                "fallback_reason": "no_citations_after_second_pass",
+                "answer_is_html": is_html_final,
+                "html_tag_summary": tags_final,
+            })
+            debug["total_time_ms"] = _now_ms() - start_total
+            with _debug_lock:
+                _debug_buffer.append(debug)
+            return QueryResponse(
+                answer=final_answer,
+                sources=[],
+                original_query=body.query,
+                rewritten_query=rewritten_query,
+                prompt_rewritten=prompt_rewritten,
+            )
     else:
         debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
 
@@ -1259,6 +1350,8 @@ def query_api(body: QueryBody) -> QueryResponse:
             }
             for s in rich
         ],
+        "answer_is_html": is_html_final,
+        "html_tag_summary": tags_final,
     })
     debug["total_time_ms"] = _now_ms() - start_total
     with _debug_lock:
@@ -1630,7 +1723,13 @@ def query_path(body: Dict[str, Any] = Body(...)):
             "first_pass": {"answer": "", "citations": [], "timing_ms": 0},
             "second_pass_invoked": False,
             "second_pass": {"answer": "", "citations": [], "timing_ms": 0},
-            "final": {"answer_used": "", "filtered_sources": [], "fallback_reason": "none"},
+            "final": {
+                "answer_used": "",
+                "filtered_sources": [],
+                "fallback_reason": "none",
+                "answer_is_html": False,
+                "html_tag_summary": [],
+            },
         },
         "total_time_ms": 0,
     }
@@ -1641,6 +1740,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
     retrieve_ms = _now_ms() - start_retrieve
     for i, ch in enumerate(hits0, 1):
         meta = ch.get("meta") or {}
+        _ensure_doc_code(meta)
         debug["retrieval"]["pre_llm_candidates"].append({
             "index": i,
             "score_pre": ch.get("score"),
@@ -1671,10 +1771,13 @@ def query_path(body: Dict[str, Any] = Body(...)):
 
     if not hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
+        final_answer, is_html_final, tags_final = _ensure_html(final_answer)
         debug["answering"]["final"].update({
             "answer_used": _truncate(final_answer, 1200),
             "filtered_sources": [],
             "fallback_reason": "no_hits_after_rerank",
+            "answer_is_html": is_html_final,
+            "html_tag_summary": tags_final,
         })
         debug["total_time_ms"] = _now_ms() - start_total
         with _debug_lock:
@@ -1687,43 +1790,67 @@ def query_path(body: Dict[str, Any] = Body(...)):
     start_ans = _now_ms()
     answer_first = ask_with_context(query, hits, chat_history=history, model=model)
     ans_ms = _now_ms() - start_ans
-    citations_first = [int(n) for n in re.findall(r"\[(\d+)\]", answer_first) if n.isdigit()]
+    answer_first, is_html_first, tags_first = _ensure_html(answer_first)
+    used_first, valid_first = _extract_numeric_citations(answer_first, len(hits))
+    citations_first = sorted(list(used_first))
     debug["answering"]["first_pass"] = {
         "answer": _truncate(answer_first, 1200),
         "citations": citations_first,
         "timing_ms": ans_ms,
     }
-    filtered = filter_cited_sources(answer_first, hits)
+    filtered = filter_cited_sources(answer_first, hits) if valid_first and used_first else []
     answer_used = answer_first
-    if not filtered:
+    is_html_final = is_html_first
+    tags_final = tags_first
+    if not valid_first or not filtered:
         debug["answering"]["second_pass_invoked"] = True
+        extra = (
+            "Your previous answer used invalid citations (e.g., [4.1] or out-of-range). "
+            "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
+            "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
+            "Maintain completeness and sentence capitalization."
+        )
+        snippet_all = " ".join([h.get("text") or "" for h in hits])
+        if "12:00" in snippet_all and "11:59" in snippet_all:
+            extra += " Include both the start and end time and the total hours if mentioned."
         start_second = _now_ms()
-        second = ask_with_context(query, hits, chat_history=history, model=model, force_citations=True)
+        second = ask_with_context(
+            query,
+            hits,
+            chat_history=history,
+            model=model,
+            force_citations=True,
+            extra_system_prompt=extra,
+        )
         second_ms = _now_ms() - start_second
-        citations_second = [int(n) for n in re.findall(r"\[(\d+)\]", second) if n.isdigit()]
+        second, is_html_second, tags_second = _ensure_html(second)
+        used_second, valid_second = _extract_numeric_citations(second, len(hits))
+        citations_second = sorted(list(used_second))
         debug["answering"]["second_pass"] = {
             "answer": _truncate(second, 1200),
             "citations": citations_second,
             "timing_ms": second_ms,
         }
-        filtered = filter_cited_sources(second, hits)
-        if filtered:
-            answer_used = second
-        else:
-            if re.search(r"\[(\d+)\]", second):
+        if valid_second and citations_second:
+            filtered = filter_cited_sources(second, hits)
+            if filtered:
                 answer_used = second
-                filtered = []
-            else:
-                final_answer = "I'm sorry, I can't answer confidently from the provided sources."
-                debug["answering"]["final"].update({
-                    "answer_used": _truncate(final_answer, 1200),
-                    "filtered_sources": [],
-                    "fallback_reason": "no_citations_after_second_pass",
-                })
-                debug["total_time_ms"] = _now_ms() - start_total
-                with _debug_lock:
-                    _debug_buffer.append(debug)
-                return {"answer": final_answer, "sources": []}
+                is_html_final = is_html_second
+                tags_final = tags_second
+        if not filtered:
+            final_answer = "I'm sorry, I can't answer confidently from the provided sources."
+            final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+            debug["answering"]["final"].update({
+                "answer_used": _truncate(final_answer, 1200),
+                "filtered_sources": [],
+                "fallback_reason": "no_citations_after_second_pass",
+                "answer_is_html": is_html_final,
+                "html_tag_summary": tags_final,
+            })
+            debug["total_time_ms"] = _now_ms() - start_total
+            with _debug_lock:
+                _debug_buffer.append(debug)
+            return {"answer": final_answer, "sources": []}
     else:
         debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
 
@@ -1740,6 +1867,8 @@ def query_path(body: Dict[str, Any] = Body(...)):
             }
             for h in filtered
         ],
+        "answer_is_html": is_html_final,
+        "html_tag_summary": tags_final,
     })
     debug["total_time_ms"] = _now_ms() - start_total
     with _debug_lock:
