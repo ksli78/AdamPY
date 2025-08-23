@@ -626,6 +626,9 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
         return re.findall(r"\b\w+\b", (s or "").lower())
 
     q_tokens = set(_tokens(query))
+    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+    query_codes = {c.lower() for c in code_pat.findall(query)}
+
     for ch in chunks:
         meta = ch.get("meta") or {}
         fields = []
@@ -641,6 +644,15 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
                 fields.extend(kws)
             else:
                 fields.append(kws)
+        doc_code = meta.get("doc_code")
+        if doc_code:
+            fields.append(doc_code)
+        version = meta.get("version")
+        if version:
+            fields.append(str(version))
+        rev_date = meta.get("revision_date")
+        if rev_date:
+            fields.append(str(rev_date))
 
         meta_tokens = set()
         for f in fields:
@@ -658,6 +670,18 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
 
         if matches:
             ch["score"] *= 1 + 0.1 * matches
+
+        if doc_code:
+            dc = str(doc_code).lower()
+            for qc in query_codes:
+                if dc == qc:
+                    ch["score"] *= 2.0
+                    break
+                norm_dc = dc.replace("-", "")
+                norm_qc = qc.replace("-", "")
+                if norm_dc == norm_qc or difflib.SequenceMatcher(None, norm_dc, norm_qc).ratio() >= 0.9:
+                    ch["score"] *= 1.5
+                    break
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
 
@@ -709,48 +733,6 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
     return chunks[:3]
 
 
-def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rerank retrieved chunks using Mistral based on relevance to the question."""
-    if not chunks:
-        return []
-    top = chunks[:10]
-    prompt_lines = [
-        f"Given the question: {question}",
-        "Rank the following snippets in order of relevance to the question.",
-        "Respond with a comma-separated list of snippet numbers in ranked order.",
-        "Snippets:"
-    ]
-    snippet_lines = []
-    for i, ch in enumerate(top, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-    user_prompt = "\n".join(prompt_lines + snippet_lines)
-
-    messages = [
-        {"role": "system", "content": "You rank text snippets by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
-    try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": "mistral-7b-instruct",
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            text = (r.json().get("message") or {}).get("content", "")
-            order = [int(n) for n in re.findall(r"\d+", text) if 1 <= int(n) <= len(top)]
-            ranked = [top[i - 1] for i in order if 1 <= i <= len(top)]
-            ranked += [top[i] for i in range(len(top)) if (i + 1) not in order]
-            return ranked[:5]
-    except Exception as e:
-        print("Rerank failed:", e)
-    return top[:5]
 
 
 def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -815,7 +797,8 @@ def _dehedge(text: str) -> str:
         text = re.sub(p, "", text, count=1)
     return text.strip()
 
-def ask_with_context(question: str, hits: List[dict], chat_history: Optional[List[dict]] = None, model: Optional[str] = None) -> str:
+def ask_with_context(question: str, hits: List[dict], chat_history: Optional[List[dict]] = None,
+                     model: Optional[str] = None, force_citations: bool = False) -> str:
     ql = (question or "").lower()
 
     meta_triggers = [
@@ -835,6 +818,8 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
         "inline bracket citations like [1], [2] right after the sentence they support. "
         "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know."
     )
+    if force_citations:
+        sys_prompt += " You MUST include at least one citation if you answer. If unsure, say you do not know."
 
     messages = [{"role": "system", "content": sys_prompt}]
     if chat_history:
@@ -968,6 +953,14 @@ class QueryResponse(BaseModel):
     prompt_rewritten: bool
 
 
+# Quick smoke tests:
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "What\u2019s the standard workweek and when does it start and end?"}'
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "Tell me about CLG-EN-PO-0301"}'
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "What is the weather on Mars?"}'
+
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
     if body.rewrite:
@@ -1010,9 +1003,24 @@ def query_api(body: QueryBody) -> QueryResponse:
         h["index"] = idx
 
     answer = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
+    filtered = filter_cited_sources(answer, hits)
+    if not filtered:
+        second = ask_with_context(rewritten_query, hits, chat_history=body.history,
+                                  model=body.model, force_citations=True)
+        filtered = filter_cited_sources(second, hits)
+        if filtered:
+            answer = second
+        else:
+            return QueryResponse(
+                answer="I'm sorry, I can't answer confidently from the provided sources.",
+                sources=[],
+                original_query=body.query,
+                rewritten_query=rewritten_query,
+                prompt_rewritten=prompt_rewritten,
+            )
 
     rich = []
-    for h in hits:
+    for h in filtered:
         meta = h.get("meta", {}) or {}
         rich.append({
             "index": h.get("index"),
