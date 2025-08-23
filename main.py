@@ -669,11 +669,11 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
     user_prompt = (
         f"Query: {query}\n\n" +
         "\n".join(snippet_lines) +
-        "\n\nReturn the numbers of the five most relevant chunks in order, comma-separated."
+        "\n\nFor each chunk, provide a relevance score from 0 to 3 in the format 'index: score', comma-separated."
     )
 
     messages = [
-        {"role": "system", "content": "You rank chunks by relevance."},
+        {"role": "system", "content": "You score chunks by relevance."},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -691,13 +691,22 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
         )
         if r.status_code == 200:
             text = (r.json().get("message") or {}).get("content", "")
-            order = [int(n) for n in re.findall(r"\d+", text) if 1 <= int(n) <= len(chunks)]
-            ranked = [chunks[i - 1] for i in order if 1 <= i <= len(chunks)]
-            ranked += [chunks[i] for i in range(len(chunks)) if (i + 1) not in order]
-            return ranked[:final_k]
+            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
+            for idx_s, score_s in pairs:
+                idx = int(idx_s)
+                if 1 <= idx <= len(chunks):
+                    chunks[idx - 1]["score"] = float(score_s)
+            for ch in chunks:
+                ch.setdefault("score", 0.0)
+            chunks.sort(key=lambda x: x["score"], reverse=True)
+            filtered = [ch for ch in chunks if ch["score"] >= 1.5][:3]
+            if not filtered:
+                print("All reranked scores below threshold")
+                return []
+            return filtered
     except Exception as e:
         print("Hybrid rerank failed:", e)
-    return chunks[:final_k]
+    return chunks[:3]
 
 
 def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -742,6 +751,59 @@ def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str
     except Exception as e:
         print("Rerank failed:", e)
     return top[:5]
+
+
+def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rerank retrieved chunks using Mistral and filter by score."""
+    if not chunks:
+        return []
+    top = chunks[:10]
+    prompt_lines = [
+        f"Given the question: {question}",
+        "Score the following snippets for relevance on a 0-3 scale.",
+        "Return comma-separated 'index: score' pairs.",
+        "Snippets:",
+    ]
+    snippet_lines = []
+    for i, ch in enumerate(top, 1):
+        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
+        snippet_lines.append(f"{i}. {snippet}")
+    user_prompt = "\n".join(prompt_lines + snippet_lines)
+
+    messages = [
+        {"role": "system", "content": "You score text snippets by relevance."},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": "mistral-7b-instruct",
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0},
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
+            timeout=60,
+        )
+        if r.status_code == 200:
+            text = (r.json().get("message") or {}).get("content", "")
+            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
+            for idx_s, score_s in pairs:
+                idx = int(idx_s)
+                if 1 <= idx <= len(top):
+                    top[idx - 1]["score"] = float(score_s)
+            for ch in top:
+                ch.setdefault("score", 0.0)
+            top.sort(key=lambda x: x["score"], reverse=True)
+            filtered = [ch for ch in top if ch["score"] >= 1.5][:3]
+            if not filtered:
+                print("All reranked scores below threshold")
+                return []
+            return filtered
+    except Exception as e:
+        print("Rerank failed:", e)
+    return top[:3]
 
 
 def _dehedge(text: str) -> str:
@@ -936,6 +998,14 @@ def query_api(body: QueryBody) -> QueryResponse:
             where["owner"] = body.owner
 
     hits = hybrid_rerank(rewritten_query, retriever, "llama3:8b", where=where)
+    if not hits:
+        return QueryResponse(
+            answer="I'm sorry, I couldn't find relevant information.",
+            sources=[],
+            original_query=body.query,
+            rewritten_query=rewritten_query,
+            prompt_rewritten=prompt_rewritten,
+        )
     for idx, h in enumerate(hits, 1):
         h["index"] = idx
 
@@ -1285,6 +1355,8 @@ def query_path(body: Dict[str, Any] = Body(...)):
     hits = search_filtered(query, k=10, path=path, paths=paths, prefix=prefix, source=source,
                            org=org, category=category, doc_code=doc_code, owner=owner)
     hits = rerank_sources(query, hits)
+    if not hits:
+        return {"answer": "I'm sorry, I couldn't find relevant information.", "sources": []}
     for idx, h in enumerate(hits, 1):
         h["index"] = idx
     answer = ask_with_context(query, hits, chat_history=history, model=model)
