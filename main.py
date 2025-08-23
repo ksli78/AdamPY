@@ -169,7 +169,7 @@ COLLECTION = os.getenv("COLLECTION", "company_docs")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1400"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 Q_MAX = int(os.getenv("INGEST_QUEUE_MAX", "8"))
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "llama3:8b")
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "mistral-7b-instruct")
 
 # ---------------- Model aliasing ----------------
 ALIAS_MAP = {
@@ -177,6 +177,7 @@ ALIAS_MAP = {
     "Adam Lite": "adam-lite:latest",
     "adam-lite": "adam-lite:latest",
     "llama3:8b": "llama3:8b",
+    "mistral-7b-instruct": "mistral:7b-instruct",
 }
 DEFAULT_MODEL = CHAT_MODEL
 
@@ -416,8 +417,8 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
     prompt = (
         "Summarize the following document in one paragraph, "
         "assign a category such as HR, Legal, Compliance, Finance, etc., "
-        "and provide 5-10 keywords as a JSON list. Return JSON with keys "
-        "summary, category, keywords. Document:\n" + text[:4000]
+        "and provide 5-10 keywords as a JSON list. Return ONLY JSON with "
+        "keys summary, category, keywords. Document:\n" + text[:4000]
     )
     try:
         r = requests.post(
@@ -432,7 +433,15 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
             timeout=120,
         )
         if r.status_code == 200:
-            content = (r.json().get("message") or {}).get("content", "")
+            content = (r.json().get("message") or {}).get("content", "").strip()
+            # strip optional Markdown code fences
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\n", "", content)
+                content = re.sub(r"\n```$", "", content)
+            # extract JSON object if extra text is returned
+            match = re.search(r"{[\s\S]*}", content)
+            if match:
+                content = match.group(0)
             try:
                 data = json.loads(content)
                 summary = data.get("summary", "").strip()
