@@ -490,12 +490,7 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in (meta or {}).items():
         if isinstance(v, (str, int, float, bool)) or v is None:
             safe[k] = v
-        elif isinstance(v, list):
-            if all(isinstance(i, (str, int, float, bool)) or i is None for i in v):
-                safe[k] = v
-            else:
-                safe[k] = json.dumps(v, ensure_ascii=False)
-        elif isinstance(v, dict):
+        elif isinstance(v, (list, dict, tuple, set)):
             try:
                 safe[k] = json.dumps(v, ensure_ascii=False)
             except Exception:
