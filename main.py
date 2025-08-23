@@ -412,79 +412,49 @@ def clean_document_text(text: str) -> str:
     return cleaned.strip()
 
 
-def summarize_document(text: str) -> Tuple[str, str, List[str]]:
-    """Use a local LLM to summarize and classify the document."""
-    prompt = (
-        "Please summarize the following document. "
-        "Return only JSON in this format: {\"summary\": \"...\", \"category\": \"...\", \"keywords\": [\"...\"]}. "
-        "Document:\n" + text[:4000]
-    )
+def summarize_document(text_content):
+    prompt = f"""
+    Summarize the following document content and extract metadata. 
+    Respond only with JSON using this exact format:
 
-    summary, category, keywords = "", "", []
+    {{
+      "summary": "<brief summary of the content>",
+      "category": "<one or two word category>",
+      "keywords": ["<keyword1>", "<keyword2>", ...]
+    }}
+
+    Document:
+    {text_content}
+
+    Only respond with valid JSON. Do not include any explanatory text or commentary.
+    """
+
+    raw_content = call_llm(prompt)
+    print("LLM raw content:", raw_content)
+
+    # Try full JSON parse
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": resolve_model(SUMMARY_MODEL),
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=120,
-        )
-        if r.status_code == 200:
+        data = json.loads(raw_content)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*?\}', raw_content, re.DOTALL)
+        if match:
             try:
-                content = (r.json().get("message") or {}).get("content", "").strip()
-                print("LLM raw content:", content)
-            except Exception as e:
-                print(f"Warning: unable to read LLM response: {e}")
-                return summary, category, keywords
-
-            # strip optional Markdown code fences
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\n", "", content)
-                content = re.sub(r"\n```$", "", content)
-
-            data = None
-            try:
-                data = json.loads(content)
-            except Exception:
-                match = re.search(r"{[\s\S]*}", content)
-                if match:
-                    try:
-                        data = json.loads(match.group(0))
-                    except Exception:
-                        pass
-
-            if not isinstance(data, dict):
-                print(f"Warning: unable to parse LLM JSON output. Raw content: {content}")
-                print("Parsed summary:", summary)
-                print("Parsed category:", category)
-                print("Parsed keywords:", keywords)
-                return summary, category, keywords
-
-            summary = str(data.get("summary", "") or "").strip()
-            category = str(data.get("category", "") or "").strip()
-            kw = data.get("keywords", [])
-            if isinstance(kw, str):
-                keywords = [k.strip() for k in re.split(r"[ ,\n]+", kw) if k.strip()]
-            elif isinstance(kw, list):
-                keywords = [str(k).strip() for k in kw if str(k).strip()]
-            else:
-                keywords = []
-            print("Parsed summary:", summary)
-            print("Parsed category:", category)
-            print("Parsed keywords:", keywords)
-            return summary, category, keywords
+                data = json.loads(match.group(0))
+            except:
+                print("Still failed to parse trimmed JSON.")
+                data = {}
         else:
-            print(f"Warning: summarize_document HTTP {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"Warning: summarize_document request failed: {e}")
+            print("Regex match for JSON failed.")
+            data = {}
 
-    print("Parsed summary:", summary)
-    print("Parsed category:", category)
-    print("Parsed keywords:", keywords)
+    summary = data.get("summary", "").strip()
+    category = data.get("category", "").strip()
+    keywords = data.get("keywords", []) if isinstance(data.get("keywords", []), list) else []
+
+    print(f"Parsed summary: {summary}")
+    print(f"Parsed category: {category}")
+    print(f"Parsed keywords: {keywords}")
+
     return summary, category, keywords
 
 
