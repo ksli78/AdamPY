@@ -169,6 +169,7 @@ COLLECTION = os.getenv("COLLECTION", "company_docs")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1400"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 Q_MAX = int(os.getenv("INGEST_QUEUE_MAX", "8"))
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "llama3:8b")
 
 # ---------------- Model aliasing ----------------
 ALIAS_MAP = {
@@ -389,10 +390,72 @@ def embed(texts: List[str]) -> List[List[float]]:
     return EMBEDDER.encode(texts, normalize_embeddings=True)
 
 
+HEADER_FOOTER_RE = re.compile(r'^(Page\b|Revision\b)', re.IGNORECASE)
+SIGNATURE_RE = re.compile(r'\n(?:Regards|Sincerely|Thank you|Thanks|Best)[\s\S]*$', re.IGNORECASE)
+LEGAL_RE = re.compile(r'\n(?:Confidentiality Notice|DISCLAIMER:)[\s\S]*$', re.IGNORECASE)
+
+def clean_document_text(text: str) -> str:
+    """Basic cleanup: remove headers/footers, signatures, and normalize whitespace."""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    lines = []
+    for ln in text.split('\n'):
+        st = ln.strip()
+        if HEADER_FOOTER_RE.match(st):
+            continue
+        lines.append(st)
+    cleaned = '\n'.join(lines)
+    cleaned = SIGNATURE_RE.sub('', cleaned)
+    cleaned = LEGAL_RE.sub('', cleaned)
+    cleaned = re.sub(r'\n{2,}', '\n', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    return cleaned.strip()
+
+
+def summarize_document(text: str) -> Tuple[str, str, List[str]]:
+    """Use a local LLM to summarize and classify the document."""
+    prompt = (
+        "Summarize the following document in one paragraph, "
+        "assign a category such as HR, Legal, Compliance, Finance, etc., "
+        "and provide 5-10 keywords as a JSON list. Return JSON with keys "
+        "summary, category, keywords. Document:\n" + text[:4000]
+    )
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": resolve_model(SUMMARY_MODEL),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": 0},
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
+            timeout=120,
+        )
+        if r.status_code == 200:
+            content = (r.json().get("message") or {}).get("content", "")
+            try:
+                data = json.loads(content)
+                summary = data.get("summary", "").strip()
+                category = data.get("category", "").strip()
+                keywords = data.get("keywords", [])
+                if isinstance(keywords, str):
+                    keywords = [k.strip() for k in re.split(r'[ ,\n]+', keywords) if k.strip()]
+                return summary, category, keywords
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "", "", []
+
+
 def upsert_document(path: _Path, source: str) -> int:
     text = read_text(path)
     if not text:
         return 0
+    text = clean_document_text(text)
+    if len(text) < 500:
+        return 0
+    summary, category, keywords = summarize_document(text)
     try:
         collection.delete(where={"path": str(path)})
     except Exception:
@@ -405,7 +468,18 @@ def upsert_document(path: _Path, source: str) -> int:
 
     doc_sha = sha1(path)
     ids = [f"{doc_sha}:{i}" for i in range(len(chunks))]
-    metas = [{"source": source, "path": str(path), "chunk": i} for i in range(len(chunks))]
+    base_meta = {
+        "source": source,
+        "path": str(path),
+        "summary": summary,
+        "category": category,
+        "keywords": keywords,
+    }
+    metas = []
+    for i in range(len(chunks)):
+        m = _sanitize_metadata(dict(base_meta))
+        m["chunk"] = i
+        metas.append(m)
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
 
@@ -416,7 +490,12 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in (meta or {}).items():
         if isinstance(v, (str, int, float, bool)) or v is None:
             safe[k] = v
-        elif isinstance(v, (list, dict, tuple, set)):
+        elif isinstance(v, list):
+            if all(isinstance(i, (str, int, float, bool)) or i is None for i in v):
+                safe[k] = v
+            else:
+                safe[k] = json.dumps(v, ensure_ascii=False)
+        elif isinstance(v, dict):
             try:
                 safe[k] = json.dumps(v, ensure_ascii=False)
             except Exception:
@@ -430,9 +509,11 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
 # -------- New: upsert pre-parsed TEXT (SharePoint path) --------
 def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
     """Upsert pre-parsed TEXT (string) as chunks+embeddings, storing ONLY embeddings+metadata."""
-    text = (text or "").strip()
-    if not text:
-        return 0
+    text = clean_document_text(text or "")
+    if len(text) < 500:
+        raise ValueError("document under 500 characters after cleanup")
+
+    summary, category, keywords = summarize_document(text)
     try:
         collection.delete(where={"doc_id": doc_id})
     except Exception:
@@ -442,6 +523,8 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
         return 0
     embs = embed(chunks)
     ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
+    base_meta = dict(base_meta)
+    base_meta.update({"summary": summary, "category": category, "keywords": keywords})
     metas = []
     for i in range(len(chunks)):
         m = _sanitize_metadata(dict(base_meta))
@@ -1206,7 +1289,10 @@ def ingest_document_api(body: IngestDocument):
 
         # 1) If text provided, use directly (fastest)
         if body.text_content and str(body.text_content).strip():
-            n = upsert_text(doc_id, body.text_content, base_meta)
+            try:
+                n = upsert_text(doc_id, body.text_content, base_meta)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content"}
 
         # 2) Else parse from base64 content bytes ephemerally
@@ -1224,7 +1310,10 @@ def ingest_document_api(body: IngestDocument):
                 except TypeError:
                     if tmp.exists():
                         tmp.unlink()
-            n = upsert_text(doc_id, text, base_meta)
+            try:
+                n = upsert_text(doc_id, text, base_meta)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "content_bytes"}
 
         raise HTTPException(status_code=400, detail="Provide either text_content or content_bytes.")
