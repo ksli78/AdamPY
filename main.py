@@ -468,9 +468,14 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
                   where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Retrieve top N chunks via Chroma then rerank them with an LLM."""
     qemb = embed([query])[0]
-    res = retriever.query(query_embeddings=[qemb], n_results=initial_k,
-                          include=["documents", "metadatas", "distances"],
-                          where=where or {})
+    query_kwargs = {
+        "query_embeddings": [qemb],
+        "n_results": initial_k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        query_kwargs["where"] = where
+    res = retriever.query(**query_kwargs)
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
