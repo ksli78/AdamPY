@@ -420,6 +420,8 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
         "and provide 5-10 keywords as a JSON list. Return ONLY JSON with "
         "keys summary, category, keywords. Document:\n" + text[:4000]
     )
+
+    summary, category, keywords = "", "", []
     try:
         r = requests.post(
             f"{OLLAMA_URL}/api/chat",
@@ -433,7 +435,12 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
             timeout=120,
         )
         if r.status_code == 200:
-            content = (r.json().get("message") or {}).get("content", "").strip()
+            try:
+                content = (r.json().get("message") or {}).get("content", "").strip()
+            except Exception as e:
+                print(f"Warning: unable to read LLM response: {e}")
+                return summary, category, keywords
+
             # strip optional Markdown code fences
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\n", "", content)
@@ -442,20 +449,59 @@ def summarize_document(text: str) -> Tuple[str, str, List[str]]:
             match = re.search(r"{[\s\S]*}", content)
             if match:
                 content = match.group(0)
+
             try:
                 data = json.loads(content)
-                
                 summary = data.get("summary", "").strip()
                 category = data.get("category", "").strip()
-                keywords = data.get("keywords", [])
-                if isinstance(keywords, str):
-                    keywords = [k.strip() for k in re.split(r'[ ,\n]+', keywords) if k.strip()]
-                return summary, category, keywords 
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return "", "", []
+                kw = data.get("keywords", [])
+                if isinstance(kw, str):
+                    keywords = [k.strip() for k in re.split(r'[ ,\n]+', kw) if k.strip()]
+                elif isinstance(kw, list):
+                    keywords = [str(k).strip() for k in kw if str(k).strip()]
+                else:
+                    keywords = []
+                return summary, category, keywords
+            except Exception as e:
+                print(f"Warning: JSON parse failed for LLM output: {e}. Content: {content}")
+
+                summary_match = re.search(
+                    r"(?i)summary\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
+                )
+                if summary_match:
+                    summary = summary_match.group(1).strip()
+
+                category_match = re.search(
+                    r"(?i)category\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
+                )
+                if category_match:
+                    category = category_match.group(1).strip()
+
+                keywords_match = re.search(
+                    r"(?i)keywords?\s*:\s*(.+?)(?=\n\w+\s*:|$)", content, re.DOTALL
+                )
+                if keywords_match:
+                    kw_text = keywords_match.group(1).strip()
+                    try:
+                        kw = json.loads(kw_text)
+                        if isinstance(kw, list):
+                            keywords = [str(k).strip() for k in kw if str(k).strip()]
+                        else:
+                            keywords = [str(kw).strip()]
+                    except Exception:
+                        keywords = [
+                            k.strip()
+                            for k in re.split(r'[ ,;\n]+', kw_text)
+                            if k.strip()
+                        ]
+
+                return summary, category, keywords
+        else:
+            print(f"Warning: summarize_document HTTP {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"Warning: summarize_document request failed: {e}")
+
+    return summary, category, keywords
 
 
 def upsert_document(path: _Path, source: str) -> int:
