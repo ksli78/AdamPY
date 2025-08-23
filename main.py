@@ -412,6 +412,29 @@ def clean_document_text(text: str) -> str:
     return cleaned.strip()
 
 
+def call_llm(prompt: str) -> str:
+    """Send a prompt to the configured LLM and return the raw text response."""
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": resolve_model(SUMMARY_MODEL),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": 0},
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
+            timeout=120,
+        )
+        if r.status_code == 200:
+            return (r.json().get("message") or {}).get("content", "")
+        else:
+            print(f"Warning: call_llm HTTP {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"Warning: call_llm request failed: {e}")
+    return ""
+
+
 def summarize_document(text_content):
     prompt = f"""
     Summarize the following document content and extract metadata. 
