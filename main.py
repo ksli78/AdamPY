@@ -236,6 +236,30 @@ def _truncate(s: str, n: int = 280) -> str:
     s = str(s)
     return s if len(s) <= n else s[:n] + "\u2026"
 
+
+def _get_text_for_hit(hit: dict) -> str:
+    """
+    Return usable passage text for a retrieved hit.
+    Tries multiple common keys (on the hit and in meta/metadata) and falls back.
+    """
+    for k in ("page_content", "content", "text", "body", "snippet"):
+        v = hit.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    meta = hit.get("meta") or hit.get("metadata") or {}
+    for k in ("page_content", "content", "text", "body", "snippet"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    title = (hit.get("title") or meta.get("title") or "").strip()
+    url = (hit.get("sp_web_url") or meta.get("sp_web_url") or hit.get("path") or meta.get("path") or "").strip()
+    if title or url:
+        return f"{title}\n{url}".strip()
+
+    return ""
+
 # --- BGE reranker (transformers, local/offline) ---
 _BGE_PATH = os.getenv("RERANKER_MODEL_PATH", "/opt/rag-models/bge-reranker-v2-m3")
 _BGE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -711,7 +735,10 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
             })
         debug["doc_code_boosts"] = doc_boosts
 
-    texts = [(ch.get("text") or ch.get("snippet") or "")[:4000] for ch in chunks]
+    texts = []
+    for ch in chunks:
+        t = _get_text_for_hit(ch)
+        texts.append(t[:4000])
     start_rerank = _now_ms()
     rerank_fallback_used = False
     try:
@@ -761,7 +788,10 @@ def rerank_sources(question: str, chunks: List[Dict[str, Any]],
 
     doc_boosts: List[Dict[str, Any]] = []
     _apply_metadata_boost(question, chunks, doc_boosts)
-    texts = [(ch.get("text") or ch.get("snippet") or "")[:4000] for ch in chunks]
+    texts = []
+    for ch in chunks:
+        t = _get_text_for_hit(ch)
+        texts.append(t[:4000])
     fallback_used = False
     try:
         scores = _bge_score_pairs(question, texts)
@@ -811,7 +841,7 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
     if any(t in ql for t in meta_triggers):
         return "I am Adam - the Amentum Document and Assistance Model (ADAM)."
 
-    context = "\n\n".join([f"[{i+1}] {h['text']}" for i, h in enumerate(hits)])
+    context = "\n\n".join([f"[{h.get('index', i+1)}] {h['text']}" for i, h in enumerate(hits)])
 
     sys_prompt = (
         "You are Adam — the Amentum Document and Assistance Model (ADAM). "
@@ -1155,9 +1185,9 @@ def query_api(body: QueryBody) -> QueryResponse:
     debug["retrieval"]["where"] = where
 
     rdebug: Dict[str, Any] = {}
-    hits = hybrid_rerank(rewritten_query, retriever, "bge-reranker-v2-m3", where=where, debug=rdebug)
+    top_hits = hybrid_rerank(rewritten_query, retriever, "bge-reranker-v2-m3", where=where, debug=rdebug)
     debug["retrieval"].update(rdebug)
-    if not hits:
+    if not top_hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
         final_answer, is_html_final, tags_final = _ensure_html(final_answer)
         debug["answering"]["final"].update({
@@ -1177,8 +1207,58 @@ def query_api(body: QueryBody) -> QueryResponse:
             rewritten_query=rewritten_query,
             prompt_rewritten=prompt_rewritten,
         )
-    for idx, h in enumerate(hits, 1):
-        h["index"] = idx
+    blocks: List[Dict[str, Any]] = []
+    for i, h in enumerate(top_hits, start=1):
+        t = _get_text_for_hit(h)
+        if not t:
+            continue
+        h["text"] = t
+        h["index"] = len(blocks) + 1
+        blocks.append({"index": h["index"], "text": t, "hit": h})
+
+    if not blocks:
+        for i, h in enumerate(top_hits, start=1):
+            t = _get_text_for_hit(h)
+            if t:
+                h["text"] = t
+                h["index"] = len(blocks) + 1
+                blocks.append({"index": h["index"], "text": t, "hit": h})
+            if len(blocks) >= 3:
+                break
+
+    hits = [b["hit"] for b in blocks]
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": b["index"],
+            "chars": len(b["text"]),
+            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
+        }
+        for b in blocks
+    ])
+
+    if not blocks:
+        final_answer = (
+            "<p>I couldn't load readable text from the retrieved sources. "
+            "Please re-index the policy with a small text preview.</p>"
+        )
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_readable_text",
+            "answer_is_html": True,
+            "html_tag_summary": ["p"],
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
+        return QueryResponse(
+            answer=final_answer,
+            sources=[],
+            original_query=body.query,
+            rewritten_query=rewritten_query,
+            prompt_rewritten=prompt_rewritten,
+        )
 
     start_ans = _now_ms()
     answer_first = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
@@ -1267,7 +1347,7 @@ def query_api(body: QueryBody) -> QueryResponse:
             "sp_web_url": meta.get("sp_web_url"),
             "path": meta.get("path"),   # present for legacy local docs
             "score": h.get("score"),
-            "snippet": (h.get("text") or "")[:400],
+            "snippet": _get_text_for_hit(h)[:280],
         })
 
     debug["answering"]["final"].update({
@@ -1687,7 +1767,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
 
     rdebug: Dict[str, Any] = {}
     start_rerank = _now_ms()
-    hits = rerank_sources(query, hits0, debug=rdebug)
+    top_hits = rerank_sources(query, hits0, debug=rdebug)
     rerank_ms = _now_ms() - start_rerank
     debug["retrieval"].update(rdebug)
     debug["retrieval"]["timing_ms"] = {"retrieve": retrieve_ms, "rerank": rerank_ms}
@@ -1697,12 +1777,12 @@ def query_path(body: Dict[str, Any] = Body(...)):
             "score": h.get("score"),
             "doc_code": (h.get("meta") or {}).get("doc_code"),
             "title": (h.get("meta") or {}).get("title"),
-            "snippet": _truncate(h.get("text") or h.get("snippet"), 280),
+            "snippet": _truncate(_get_text_for_hit(h), 280),
         }
-        for i, h in enumerate(hits)
+        for i, h in enumerate(top_hits)
     ]
 
-    if not hits:
+    if not top_hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
         final_answer, is_html_final, tags_final = _ensure_html(final_answer)
         debug["answering"]["final"].update({
@@ -1717,8 +1797,51 @@ def query_path(body: Dict[str, Any] = Body(...)):
             _debug_buffer.append(debug)
         return {"answer": final_answer, "sources": []}
 
-    for idx, h in enumerate(hits, 1):
-        h["index"] = idx
+    blocks: List[Dict[str, Any]] = []
+    for i, h in enumerate(top_hits, start=1):
+        t = _get_text_for_hit(h)
+        if not t:
+            continue
+        h["text"] = t
+        h["index"] = len(blocks) + 1
+        blocks.append({"index": h["index"], "text": t, "hit": h})
+
+    if not blocks:
+        for i, h in enumerate(top_hits, start=1):
+            t = _get_text_for_hit(h)
+            if t:
+                h["text"] = t
+                h["index"] = len(blocks) + 1
+                blocks.append({"index": h["index"], "text": t, "hit": h})
+            if len(blocks) >= 3:
+                break
+
+    hits = [b["hit"] for b in blocks]
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": b["index"],
+            "chars": len(b["text"]),
+            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
+        }
+        for b in blocks
+    ])
+
+    if not blocks:
+        final_answer = (
+            "<p>I couldn't load readable text from the retrieved sources. Please re-index the policy with a small text preview.</p>"
+        )
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_readable_text",
+            "answer_is_html": True,
+            "html_tag_summary": ["p"],
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
+        return {"answer": final_answer, "sources": []}
 
     start_ans = _now_ms()
     answer_first = ask_with_context(query, hits, chat_history=history, model=model)
@@ -1786,6 +1909,8 @@ def query_path(body: Dict[str, Any] = Body(...)):
             return {"answer": final_answer, "sources": []}
     else:
         debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
+    for h in filtered:
+        h["snippet"] = _get_text_for_hit(h)[:280]
 
     debug["answering"]["final"].update({
         "answer_used": _truncate(answer_used, 1200),
@@ -1796,7 +1921,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
                 "title": (h.get("meta") or {}).get("title"),
                 "sp_web_url": (h.get("meta") or {}).get("sp_web_url"),
                 "score": h.get("score"),
-                "snippet": _truncate((h.get("text") or ""), 280),
+                "snippet": _truncate(h.get("snippet"), 280),
             }
             for h in filtered
         ],
