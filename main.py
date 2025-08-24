@@ -260,45 +260,70 @@ def _get_text_for_hit(hit: dict) -> str:
 
     return ""
 
-# --- BGE reranker (transformers, local/offline) ---
+# ---- BGE reranker (local/offline) with safe fallback ----
 _BGE_PATH = os.getenv("RERANKER_MODEL_PATH", "/opt/rag-models/bge-reranker-v2-m3")
 _BGE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+_BGE_OK = False
 try:
     _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
     _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
     _BGE_MODEL.to(_BGE_DEVICE)
     _BGE_MODEL.eval()
+    _BGE_OK = True
 except Exception:
-    _BGE_DEVICE = "cpu"
-    _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
-    _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
-    _BGE_MODEL.to(_BGE_DEVICE)
-    _BGE_MODEL.eval()
+    _BGE_OK = False
 
 
-def _bge_score_pairs(query: str, texts: List[str], batch_size: int = 16, max_length: int = 512) -> List[float]:
-    """
-    Returns a list of relevance scores (higher = more relevant) for (query, text) pairs.
-    Uses the local BGE cross-encoder; fully offline.
-    """
+def _bge_scores(query: str, texts: List[str], batch_size: int = 16, max_length: int = 512) -> List[float]:
     scores: List[float] = []
     for i in range(0, len(texts), batch_size):
-        bt = texts[i:i + batch_size]
-        inputs = _BGE_TOK(
-            text=[query] * len(bt),
-            text_pair=bt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-            padding=True,
-        )
-        inputs = {k: v.to(_BGE_DEVICE) for k, v in inputs.items()}
+        bt = texts[i:i+batch_size]
+        enc = _BGE_TOK(text=[query]*len(bt), text_pair=bt, truncation=True,
+                       max_length=max_length, padding=True, return_tensors="pt")
+        enc = {k: v.to(_BGE_DEVICE) for k, v in enc.items()}
         with torch.no_grad():
-            logits = _BGE_MODEL(**inputs).logits.squeeze(-1)
-        batch_scores = torch.sigmoid(logits).detach().cpu().tolist()
-        scores.extend(batch_scores)
+            logits = _BGE_MODEL(**enc).logits.squeeze(-1)  # [B]
+        scores.extend(torch.sigmoid(logits).detach().cpu().tolist())
     return scores
+
+
+_TOKEN_RE = re.compile(r"\b[\w:.-]{3,}\b", re.UNICODE)
+
+
+def _tokens_generic(s: str) -> set:
+    return set(t.lower() for t in _TOKEN_RE.findall(s or ""))
+
+
+def _extract_passage(text: str, query: str, window_chars: int = 800) -> str:
+    """
+    Generic passage picker: prefer segments whose tokens overlap with the query.
+    No domain-specific words; purely lexical overlap + small window.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    qtok = _tokens_generic(query)
+    if not qtok:
+        return t[:window_chars]
+
+    # split to sentences (very rough)
+    sents = re.split(r'(?<=[.!?])\s+', t)
+    # score each sentence by token overlap
+    scored = [(i, len(_tokens_generic(s) & qtok), s) for i, s in enumerate(sents)]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if not scored or scored[0][1] == 0:
+        return t[:window_chars]
+
+    # take a window around the best sentence
+    i_best = scored[0][0]
+    left = max(0, i_best - 2)
+    right = min(len(sents), i_best + 3)
+    excerpt = " ".join(sents[left:right]).strip()
+    if len(excerpt) < window_chars // 2 and len(t) > window_chars:
+        # pad to window size if too short
+        start = max(0, t.lower().find(excerpt.lower()) - (window_chars // 4))
+        return t[start:start + window_chars]
+    return excerpt[:window_chars]
 
 # ---------------- Helpers ----------------
 SUPPORTED = (
@@ -735,32 +760,38 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
             })
         debug["doc_code_boosts"] = doc_boosts
 
-    texts = []
-    for ch in chunks:
-        t = _get_text_for_hit(ch)
-        texts.append(t[:4000])
+    # --- BGE rerank attempt over a widened pool ---
+    pool = chunks[:max(len(chunks), 40)]  # widen pool (generic)
+    texts = [(ch.get("text") or "")[:4000] for ch in pool]
+
     start_rerank = _now_ms()
     rerank_fallback_used = False
-    try:
-        bge_scores = _bge_score_pairs(query, texts)
-        for ch, s in zip(chunks, bge_scores):
-            ch["score"] = float(s) * ch.get("_boost", 1.0)
-    except Exception as e:
-        print("Hybrid rerank failed:", e)
+    if _BGE_OK and texts:
+        try:
+            bge = _bge_scores(query, texts, batch_size=16, max_length=512)
+            for ch, s in zip(pool, bge):
+                ch["score"] = float(s) * ch.get("_boost", 1.0)
+            pool.sort(key=lambda x: x["score"], reverse=True)
+            chunks = pool
+        except Exception:
+            rerank_fallback_used = True
+    else:
         rerank_fallback_used = True
-        for ch in chunks:
-            ch["score"] = ch.get("score", 0.0)
-    chunks.sort(key=lambda x: x["score"], reverse=True)
+
+    if rerank_fallback_used:
+        pass  # fallback to existing order/logic
+
     result = chunks[:final_k] if chunks else []
     rerank_ms = _now_ms() - start_rerank
 
     if debug is not None:
-        debug["reranker"] = {
-            "raw_text": "",
+        debug["reranker"] = debug.get("reranker", {})
+        debug["reranker"].update({
+            "raw_text": debug["reranker"].get("raw_text", ""),
             "parsed": [{"index": i + 1, "score": h.get("score")} for i, h in enumerate(result)],
-            "threshold": 0.0,
-            "fallback_used": rerank_fallback_used,
-        }
+            "threshold": debug["reranker"].get("threshold", 0.0),
+            "fallback_used": bool(rerank_fallback_used),
+        })
         debug["post_rerank_hits"] = []
         for i, h in enumerate(result, 1):
             meta = h.get("meta") or {}
@@ -793,15 +824,18 @@ def rerank_sources(question: str, chunks: List[Dict[str, Any]],
         t = _get_text_for_hit(ch)
         texts.append(t[:4000])
     fallback_used = False
-    try:
-        scores = _bge_score_pairs(question, texts)
-        for ch, s in zip(chunks, scores):
-            ch["score"] = float(s) * ch.get("_boost", 1.0)
-    except Exception as e:
-        print("Rerank failed:", e)
+    if _BGE_OK:
+        try:
+            scores = _bge_scores(question, texts)
+            for ch, s in zip(chunks, scores):
+                ch["score"] = float(s) * ch.get("_boost", 1.0)
+        except Exception as e:
+            print("Rerank failed:", e)
+            fallback_used = True
+            for ch in chunks:
+                ch["score"] = ch.get("score", 0.0)
+    else:
         fallback_used = True
-        for ch in chunks:
-            ch["score"] = ch.get("score", 0.0)
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
     top = chunks[:3]
@@ -1029,9 +1063,6 @@ def _apply_metadata_boost(query: str, chunks: List[Dict[str, Any]], doc_boosts: 
                     break
         if (meta.get("category") or "").lower() == "policy":
             boost *= 1.15
-        t = (meta.get("title") or "").lower()
-        if any(k in t for k in ["workweek", "work week", "work hours", "timekeeping", "pto", "decisions tool"]):
-            boost *= 1.10
         ch.setdefault("_boost", boost)
         ch["score"] *= boost
 
@@ -1129,7 +1160,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         "request_id": str(uuid.uuid4()),
         "timestamp_ms": _now_ms(),
         "endpoint": "/query",
-        "model": {"generator": resolve_model(body.model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
+        "model": {"generator": resolve_model(body.model), "reranker": "bge-reranker-v2-m3 (transformers, local)" if _BGE_OK else "mistral-7b-instruct"},
         "query": {
             "original": body.query,
             "rewritten": "",
@@ -1207,37 +1238,22 @@ def query_api(body: QueryBody) -> QueryResponse:
             rewritten_query=rewritten_query,
             prompt_rewritten=prompt_rewritten,
         )
-    blocks: List[Dict[str, Any]] = []
-    for i, h in enumerate(top_hits, start=1):
+    hits: List[Dict[str, Any]] = []
+    for h in top_hits:
         t = _get_text_for_hit(h)
-        if not t:
-            continue
-        h["text"] = t
-        h["index"] = len(blocks) + 1
-        blocks.append({"index": h["index"], "text": t, "hit": h})
-
-    if not blocks:
-        for i, h in enumerate(top_hits, start=1):
+        if t:
+            h["text"] = t
+            hits.append(h)
+    if not hits:
+        for h in top_hits:
             t = _get_text_for_hit(h)
             if t:
                 h["text"] = t
-                h["index"] = len(blocks) + 1
-                blocks.append({"index": h["index"], "text": t, "hit": h})
-            if len(blocks) >= 3:
+                hits.append(h)
+            if len(hits) >= 3:
                 break
 
-    hits = [b["hit"] for b in blocks]
-
-    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
-        {
-            "index": b["index"],
-            "chars": len(b["text"]),
-            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
-        }
-        for b in blocks
-    ])
-
-    if not blocks:
+    if not hits:
         final_answer = (
             "<p>I couldn't load readable text from the retrieved sources. "
             "Please re-index the policy with a small text preview.</p>"
@@ -1259,6 +1275,20 @@ def query_api(body: QueryBody) -> QueryResponse:
             rewritten_query=rewritten_query,
             prompt_rewritten=prompt_rewritten,
         )
+
+    for i, h in enumerate(hits):
+        raw = h.get("text") or ""
+        h["text"] = _extract_passage(raw, rewritten_query)
+        h["index"] = i + 1
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": i + 1,
+            "chars": len(h.get("text") or ""),
+            "preview": (h.get("text") or "")[:120] + ("\u2026" if len(h.get("text") or "") > 120 else ""),
+        }
+        for i, h in enumerate(hits)
+    ])
 
     start_ans = _now_ms()
     answer_first = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
@@ -1718,7 +1748,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
         "request_id": str(uuid.uuid4()),
         "timestamp_ms": _now_ms(),
         "endpoint": "/query_path",
-        "model": {"generator": resolve_model(model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
+        "model": {"generator": resolve_model(model), "reranker": "bge-reranker-v2-m3 (transformers, local)" if _BGE_OK else "mistral-7b-instruct"},
         "query": {
             "original": query,
             "rewritten": query,
@@ -1797,37 +1827,22 @@ def query_path(body: Dict[str, Any] = Body(...)):
             _debug_buffer.append(debug)
         return {"answer": final_answer, "sources": []}
 
-    blocks: List[Dict[str, Any]] = []
-    for i, h in enumerate(top_hits, start=1):
+    hits: List[Dict[str, Any]] = []
+    for h in top_hits:
         t = _get_text_for_hit(h)
-        if not t:
-            continue
-        h["text"] = t
-        h["index"] = len(blocks) + 1
-        blocks.append({"index": h["index"], "text": t, "hit": h})
-
-    if not blocks:
-        for i, h in enumerate(top_hits, start=1):
+        if t:
+            h["text"] = t
+            hits.append(h)
+    if not hits:
+        for h in top_hits:
             t = _get_text_for_hit(h)
             if t:
                 h["text"] = t
-                h["index"] = len(blocks) + 1
-                blocks.append({"index": h["index"], "text": t, "hit": h})
-            if len(blocks) >= 3:
+                hits.append(h)
+            if len(hits) >= 3:
                 break
 
-    hits = [b["hit"] for b in blocks]
-
-    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
-        {
-            "index": b["index"],
-            "chars": len(b["text"]),
-            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
-        }
-        for b in blocks
-    ])
-
-    if not blocks:
+    if not hits:
         final_answer = (
             "<p>I couldn't load readable text from the retrieved sources. Please re-index the policy with a small text preview.</p>"
         )
@@ -1842,6 +1857,20 @@ def query_path(body: Dict[str, Any] = Body(...)):
         with _debug_lock:
             _debug_buffer.append(debug)
         return {"answer": final_answer, "sources": []}
+
+    for i, h in enumerate(hits):
+        raw = h.get("text") or ""
+        h["text"] = _extract_passage(raw, query)
+        h["index"] = i + 1
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": i + 1,
+            "chars": len(h.get("text") or ""),
+            "preview": (h.get("text") or "")[:120] + ("\u2026" if len(h.get("text") or "") > 120 else ""),
+        }
+        for i, h in enumerate(hits)
+    ])
 
     start_ans = _now_ms()
     answer_first = ask_with_context(query, hits, chat_history=history, model=model)
