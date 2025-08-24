@@ -19,6 +19,8 @@ import subprocess
 import zipfile
 import base64
 import tempfile
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from collections import deque
 from pathlib import Path as _Path
 from typing import List, Optional, Dict, Any, Tuple, Set
@@ -233,6 +235,46 @@ def _truncate(s: str, n: int = 280) -> str:
         return ""
     s = str(s)
     return s if len(s) <= n else s[:n] + "\u2026"
+
+# --- BGE reranker (transformers, local/offline) ---
+_BGE_PATH = os.getenv("RERANKER_MODEL_PATH", "/opt/rag-models/bge-reranker-v2-m3")
+_BGE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+try:
+    _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL.to(_BGE_DEVICE)
+    _BGE_MODEL.eval()
+except Exception:
+    _BGE_DEVICE = "cpu"
+    _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL.to(_BGE_DEVICE)
+    _BGE_MODEL.eval()
+
+
+def _bge_score_pairs(query: str, texts: List[str], batch_size: int = 16, max_length: int = 512) -> List[float]:
+    """
+    Returns a list of relevance scores (higher = more relevant) for (query, text) pairs.
+    Uses the local BGE cross-encoder; fully offline.
+    """
+    scores: List[float] = []
+    for i in range(0, len(texts), batch_size):
+        bt = texts[i:i + batch_size]
+        inputs = _BGE_TOK(
+            text=[query] * len(bt),
+            text_pair=bt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            padding=True,
+        )
+        inputs = {k: v.to(_BGE_DEVICE) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = _BGE_MODEL(**inputs).logits.squeeze(-1)
+        batch_scores = torch.sigmoid(logits).detach().cpu().tolist()
+        scores.extend(batch_scores)
+    return scores
 
 # ---------------- Helpers ----------------
 SUPPORTED = (
@@ -620,7 +662,7 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
                   initial_k: int = 15, final_k: int = 5,
                   where: Optional[Dict[str, Any]] = None,
                   debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Retrieve top N chunks via Chroma then rerank them with an LLM."""
+    """Retrieve top N chunks via Chroma then rerank them with a local BGE model."""
     start_retrieve = _now_ms()
     qemb = embed([query])[0]
     query_kwargs = {
@@ -642,85 +684,14 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
             debug.update({
                 "pre_llm_candidates": [],
                 "doc_code_boosts": [],
-                "reranker": {"raw_text": "", "parsed": [], "threshold": 1.0, "fallback_used": True},
+                "reranker": {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": True},
                 "post_rerank_hits": [],
                 "timing_ms": {"retrieve": retrieve_ms, "rerank": 0},
             })
         return []
 
-    # --- Metadata-aware boosting ---
-    def _tokens(s: str) -> List[str]:
-        return re.findall(r"\b\w+\b", (s or "").lower())
-
-    q_tokens = set(_tokens(query))
-    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
-    query_codes = {c.lower() for c in code_pat.findall(query)}
-
     doc_boosts: List[Dict[str, Any]] = []
-    for idx, ch in enumerate(chunks, 1):
-        meta = ch.get("meta") or {}
-        _ensure_doc_code(meta)
-        fields = []
-        cat = meta.get("category")
-        if cat:
-            fields.append(cat)
-        title = meta.get("title")
-        if title:
-            fields.append(title)
-        kws = meta.get("keywords")
-        if kws:
-            if isinstance(kws, list):
-                fields.extend(kws)
-            else:
-                fields.append(kws)
-        doc_code = meta.get("doc_code")
-        if doc_code:
-            fields.append(doc_code)
-        version = meta.get("version")
-        if version:
-            fields.append(str(version))
-        rev_date = meta.get("revision_date")
-        if rev_date:
-            fields.append(str(rev_date))
-
-        meta_tokens = set()
-        for f in fields:
-            meta_tokens.update(_tokens(str(f)))
-
-        matches = 0
-        for qt in q_tokens:
-            if qt in meta_tokens:
-                matches += 1
-            else:
-                for mt in meta_tokens:
-                    if difflib.SequenceMatcher(None, qt, mt).ratio() >= 0.8:
-                        matches += 1
-                        break
-
-        if matches:
-            ch["score"] *= 1 + 0.1 * matches
-
-        if doc_code:
-            dc = str(doc_code).lower()
-            boosted = False
-            for qc in query_codes:
-                if dc == qc:
-                    ch["score"] *= 3.0
-                    doc_boosts.append({"index": idx, "reason": "exact", "multiplier": 3.0})
-                    boosted = True
-                    break
-                norm_dc = dc.replace("-", "")
-                norm_qc = qc.replace("-", "")
-                if norm_dc == norm_qc or difflib.SequenceMatcher(None, norm_dc, norm_qc).ratio() >= 0.9:
-                    ch["score"] *= 2.0
-                    doc_boosts.append({"index": idx, "reason": "fuzzy", "multiplier": 2.0})
-                    boosted = True
-                    break
-        if (meta.get("category") or "").lower() == "policy":
-            ch["score"] *= 1.15
-        t = (meta.get("title") or "").lower()
-        if any(k in t for k in ["workweek", "work week", "work hours", "timekeeping", "pto", "decisions tool"]):
-            ch["score"] *= 1.10
+    _apply_metadata_boost(query, chunks, doc_boosts)
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
     pre_llm = [dict(ch) for ch in chunks]
@@ -740,90 +711,28 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
             })
         debug["doc_code_boosts"] = doc_boosts
 
-    snippet_lines = []
-    for i, ch in enumerate(chunks, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-
-    user_prompt = (
-        f"Query: {query}\n\n" +
-        "\n".join(snippet_lines) +
-        "\n\nFor each chunk, provide a relevance score from 0 to 3 in the format 'index: score', comma-separated."
-    )
-
-    messages = [
-        {"role": "system", "content": "You score chunks by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
-
+    texts = [(ch.get("text") or ch.get("snippet") or "")[:4000] for ch in chunks]
     start_rerank = _now_ms()
-    raw_text = ""
-    parsed_pairs: List[Dict[str, Any]] = []
-    fallback_used = False
-    result: List[Dict[str, Any]] = []
+    rerank_fallback_used = False
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": reranker_model_name,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            raw_text = (r.json().get("message") or {}).get("content", "")
-            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", raw_text)
-            if pairs:
-                for idx_s, score_s in pairs:
-                    idx = int(idx_s)
-                    if 1 <= idx <= len(chunks):
-                        score = float(score_s)
-                        chunks[idx - 1]["score"] = score
-                        parsed_pairs.append({"index": idx, "score": score})
-                for ch in chunks:
-                    ch.setdefault("score", 0.0)
-                chunks.sort(key=lambda x: x["score"], reverse=True)
-            else:
-                order = [int(n) for n in re.findall(r"\d+", raw_text)
-                         if 1 <= int(n) <= len(chunks)]
-                if order:
-                    for rank, idx in enumerate(order):
-                        score = float(len(order) - rank)
-                        chunks[idx - 1]["score"] = score
-                        parsed_pairs.append({"index": idx, "score": score})
-                    for ch in chunks:
-                        ch.setdefault("score", 0.0)
-                    chunks.sort(key=lambda x: x["score"], reverse=True)
-                else:
-                    print("Could not parse reranker output, using pre-LLM order")
-                    fallback_used = True
-                    result = pre_llm[:3]
-            if not result:
-                filtered = [ch for ch in chunks if ch["score"] >= 1.0][:3]
-                if not filtered:
-                    print("All reranked scores below threshold; using pre-LLM order")
-                    fallback_used = True
-                    result = pre_llm[:3]
-                else:
-                    result = filtered
-        else:
-            fallback_used = True
-            result = pre_llm[:3]
+        bge_scores = _bge_score_pairs(query, texts)
+        for ch, s in zip(chunks, bge_scores):
+            ch["score"] = float(s) * ch.get("_boost", 1.0)
     except Exception as e:
         print("Hybrid rerank failed:", e)
-        fallback_used = True
-        result = pre_llm[:3]
+        rerank_fallback_used = True
+        for ch in chunks:
+            ch["score"] = ch.get("score", 0.0)
+    chunks.sort(key=lambda x: x["score"], reverse=True)
+    result = chunks[:final_k] if chunks else []
     rerank_ms = _now_ms() - start_rerank
 
     if debug is not None:
         debug["reranker"] = {
-            "raw_text": _truncate(raw_text, 1000),
-            "parsed": parsed_pairs,
-            "threshold": 1.0,
-            "fallback_used": fallback_used,
+            "raw_text": "",
+            "parsed": [{"index": i + 1, "score": h.get("score")} for i, h in enumerate(result)],
+            "threshold": 0.0,
+            "fallback_used": rerank_fallback_used,
         }
         debug["post_rerank_hits"] = []
         for i, h in enumerate(result, 1):
@@ -844,90 +753,40 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
 
 def rerank_sources(question: str, chunks: List[Dict[str, Any]],
                    debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Rerank retrieved chunks using Mistral and filter by score."""
+    """Rerank retrieved chunks using local BGE scoring."""
     if not chunks:
         if debug is not None:
-            debug.update({
-                "raw_text": "",
-                "parsed": [],
-                "threshold": 1.5,
-                "fallback_used": True,
-            })
+            debug["reranker"] = {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": True}
         return []
-    top = chunks[:10]
-    prompt_lines = [
-        f"Given the question: {question}",
-        "Score the following snippets for relevance on a 0-3 scale.",
-        "Return comma-separated 'index: score' pairs.",
-        "Snippets:",
-    ]
-    snippet_lines = []
-    for i, ch in enumerate(top, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-    user_prompt = "\n".join(prompt_lines + snippet_lines)
 
-    messages = [
-        {"role": "system", "content": "You score text snippets by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
-    raw_text = ""
-    parsed: List[Dict[str, Any]] = []
+    doc_boosts: List[Dict[str, Any]] = []
+    _apply_metadata_boost(question, chunks, doc_boosts)
+    texts = [(ch.get("text") or ch.get("snippet") or "")[:4000] for ch in chunks]
     fallback_used = False
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": "mistral-7b-instruct",
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            raw_text = (r.json().get("message") or {}).get("content", "")
-            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", raw_text)
-            for idx_s, score_s in pairs:
-                idx = int(idx_s)
-                if 1 <= idx <= len(top):
-                    sc = float(score_s)
-                    top[idx - 1]["score"] = sc
-                    parsed.append({"index": idx, "score": sc})
-            for ch in top:
-                ch.setdefault("score", 0.0)
-            top.sort(key=lambda x: x["score"], reverse=True)
-            filtered = [ch for ch in top if ch["score"] >= 1.5][:3]
-            if not filtered:
-                print("All reranked scores below threshold")
-                if debug is not None:
-                    debug.update({
-                        "raw_text": _truncate(raw_text, 1000),
-                        "parsed": parsed,
-                        "threshold": 1.5,
-                        "fallback_used": False,
-                    })
-                return []
-            if debug is not None:
-                debug.update({
-                    "raw_text": _truncate(raw_text, 1000),
-                    "parsed": parsed,
-                    "threshold": 1.5,
-                    "fallback_used": False,
-                })
-            return filtered
+        scores = _bge_score_pairs(question, texts)
+        for ch, s in zip(chunks, scores):
+            ch["score"] = float(s) * ch.get("_boost", 1.0)
     except Exception as e:
         print("Rerank failed:", e)
         fallback_used = True
+        for ch in chunks:
+            ch["score"] = ch.get("score", 0.0)
+
+    chunks.sort(key=lambda x: x["score"], reverse=True)
+    top = chunks[:3]
+
     if debug is not None:
         debug.update({
-            "raw_text": _truncate(raw_text, 1000),
-            "parsed": parsed,
-            "threshold": 1.5,
-            "fallback_used": fallback_used,
+            "doc_code_boosts": doc_boosts,
+            "reranker": {
+                "raw_text": "",
+                "parsed": [{"index": i + 1, "score": h.get("score")} for i, h in enumerate(top)],
+                "threshold": 0.0,
+                "fallback_used": fallback_used,
+            },
         })
-    return top[:3]
+    return top
 
 
 def _dehedge(text: str) -> str:
@@ -1072,6 +931,80 @@ def _ensure_doc_code(meta: Dict[str, Any]) -> None:
     if m:
         meta["doc_code"] = m.group(1)
 
+
+def _apply_metadata_boost(query: str, chunks: List[Dict[str, Any]], doc_boosts: Optional[List[Dict[str, Any]]] = None) -> None:
+    def _tokens(s: str) -> List[str]:
+        return re.findall(r"\b\w+\b", (s or "").lower())
+
+    q_tokens = set(_tokens(query))
+    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+    query_codes = {c.lower() for c in code_pat.findall(query)}
+    if doc_boosts is None:
+        doc_boosts = []
+    for idx, ch in enumerate(chunks, 1):
+        meta = ch.get("meta") or {}
+        _ensure_doc_code(meta)
+        fields = []
+        cat = meta.get("category")
+        if cat:
+            fields.append(cat)
+        title = meta.get("title")
+        if title:
+            fields.append(title)
+        kws = meta.get("keywords")
+        if kws:
+            if isinstance(kws, list):
+                fields.extend(kws)
+            else:
+                fields.append(kws)
+        doc_code = meta.get("doc_code")
+        if doc_code:
+            fields.append(doc_code)
+        version = meta.get("version")
+        if version:
+            fields.append(str(version))
+        rev_date = meta.get("revision_date")
+        if rev_date:
+            fields.append(str(rev_date))
+
+        meta_tokens = set()
+        for f in fields:
+            meta_tokens.update(_tokens(str(f)))
+
+        matches = 0
+        for qt in q_tokens:
+            if qt in meta_tokens:
+                matches += 1
+            else:
+                for mt in meta_tokens:
+                    if difflib.SequenceMatcher(None, qt, mt).ratio() >= 0.8:
+                        matches += 1
+                        break
+
+        boost = 1.0
+        if matches:
+            boost *= 1 + 0.1 * matches
+        if doc_code:
+            dc = str(doc_code).lower()
+            for qc in query_codes:
+                if dc == qc:
+                    boost *= 3.0
+                    doc_boosts.append({"index": idx, "reason": "exact", "multiplier": 3.0})
+                    break
+                norm_dc = dc.replace("-", "")
+                norm_qc = qc.replace("-", "")
+                if norm_dc == norm_qc or difflib.SequenceMatcher(None, norm_dc, norm_qc).ratio() >= 0.9:
+                    boost *= 2.0
+                    doc_boosts.append({"index": idx, "reason": "fuzzy", "multiplier": 2.0})
+                    break
+        if (meta.get("category") or "").lower() == "policy":
+            boost *= 1.15
+        t = (meta.get("title") or "").lower()
+        if any(k in t for k in ["workweek", "work week", "work hours", "timekeeping", "pto", "decisions tool"]):
+            boost *= 1.10
+        ch.setdefault("_boost", boost)
+        ch["score"] *= boost
+
 def rewrite_prompt(prompt: str) -> str:
     """Use Mistral to safely rewrite vague prompts, without changing intent."""
     try:
@@ -1166,7 +1099,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         "request_id": str(uuid.uuid4()),
         "timestamp_ms": _now_ms(),
         "endpoint": "/query",
-        "model": {"generator": resolve_model(body.model), "reranker": "mistral-7b-instruct"},
+        "model": {"generator": resolve_model(body.model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
         "query": {
             "original": body.query,
             "rewritten": "",
@@ -1222,7 +1155,7 @@ def query_api(body: QueryBody) -> QueryResponse:
     debug["retrieval"]["where"] = where
 
     rdebug: Dict[str, Any] = {}
-    hits = hybrid_rerank(rewritten_query, retriever, "mistral-7b-instruct", where=where, debug=rdebug)
+    hits = hybrid_rerank(rewritten_query, retriever, "bge-reranker-v2-m3", where=where, debug=rdebug)
     debug["retrieval"].update(rdebug)
     if not hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
@@ -1705,7 +1638,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
         "request_id": str(uuid.uuid4()),
         "timestamp_ms": _now_ms(),
         "endpoint": "/query_path",
-        "model": {"generator": resolve_model(model), "reranker": "mistral-7b-instruct"},
+        "model": {"generator": resolve_model(model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
         "query": {
             "original": query,
             "rewritten": query,
@@ -1716,7 +1649,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
         "retrieval": {"where": where_filters or None,
                        "pre_llm_candidates": [],
                        "doc_code_boosts": [],
-                       "reranker": {"raw_text": "", "parsed": [], "threshold": 1.5, "fallback_used": False},
+                       "reranker": {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": False},
                        "post_rerank_hits": [],
                        "timing_ms": {"retrieve": 0, "rerank": 0}},
         "answering": {
