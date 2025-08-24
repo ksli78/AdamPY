@@ -19,11 +19,14 @@ import subprocess
 import zipfile
 import base64
 import tempfile
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from collections import deque
 from pathlib import Path as _Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException
+from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -217,6 +220,85 @@ app.add_middleware(
 client = chromadb.PersistentClient(path=CHROMA_DIR)
 collection = client.get_or_create_collection(COLLECTION)
 retriever = collection
+
+_debug_lock = threading.Lock()
+_debug_buffer = deque(maxlen=10)
+_DEBUG_API_KEY = os.getenv("DEBUG_API_KEY", "")
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _truncate(s: str, n: int = 280) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return s if len(s) <= n else s[:n] + "\u2026"
+
+
+def _get_text_for_hit(hit: dict) -> str:
+    """
+    Return usable passage text for a retrieved hit.
+    Tries multiple common keys (on the hit and in meta/metadata) and falls back.
+    """
+    for k in ("page_content", "content", "text", "body", "snippet"):
+        v = hit.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    meta = hit.get("meta") or hit.get("metadata") or {}
+    for k in ("page_content", "content", "text", "body", "snippet"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    title = (hit.get("title") or meta.get("title") or "").strip()
+    url = (hit.get("sp_web_url") or meta.get("sp_web_url") or hit.get("path") or meta.get("path") or "").strip()
+    if title or url:
+        return f"{title}\n{url}".strip()
+
+    return ""
+
+# --- BGE reranker (transformers, local/offline) ---
+_BGE_PATH = os.getenv("RERANKER_MODEL_PATH", "/opt/rag-models/bge-reranker-v2-m3")
+_BGE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+try:
+    _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL.to(_BGE_DEVICE)
+    _BGE_MODEL.eval()
+except Exception:
+    _BGE_DEVICE = "cpu"
+    _BGE_TOK = AutoTokenizer.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL = AutoModelForSequenceClassification.from_pretrained(_BGE_PATH, local_files_only=True)
+    _BGE_MODEL.to(_BGE_DEVICE)
+    _BGE_MODEL.eval()
+
+
+def _bge_score_pairs(query: str, texts: List[str], batch_size: int = 16, max_length: int = 512) -> List[float]:
+    """
+    Returns a list of relevance scores (higher = more relevant) for (query, text) pairs.
+    Uses the local BGE cross-encoder; fully offline.
+    """
+    scores: List[float] = []
+    for i in range(0, len(texts), batch_size):
+        bt = texts[i:i + batch_size]
+        inputs = _BGE_TOK(
+            text=[query] * len(bt),
+            text_pair=bt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            padding=True,
+        )
+        inputs = {k: v.to(_BGE_DEVICE) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = _BGE_MODEL(**inputs).logits.squeeze(-1)
+        batch_scores = torch.sigmoid(logits).detach().cpu().tolist()
+        scores.extend(batch_scores)
+    return scores
 
 # ---------------- Helpers ----------------
 SUPPORTED = (
@@ -602,8 +684,10 @@ def search(query: str, k: int = 4) -> List[Dict[str, Any]]:
 
 def hybrid_rerank(query: str, retriever, reranker_model_name: str,
                   initial_k: int = 15, final_k: int = 5,
-                  where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Retrieve top N chunks via Chroma then rerank them with an LLM."""
+                  where: Optional[Dict[str, Any]] = None,
+                  debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Retrieve top N chunks via Chroma then rerank them with a local BGE model."""
+    start_retrieve = _now_ms()
     qemb = embed([query])[0]
     query_kwargs = {
         "query_embeddings": [qemb],
@@ -613,197 +697,126 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
     if where:
         query_kwargs["where"] = where
     res = retriever.query(**query_kwargs)
+    retrieve_ms = _now_ms() - start_retrieve
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
     chunks = [{"text": d, "meta": m, "score": float(1.0 / (1e-5 + dist))}
               for d, m, dist in zip(docs, metas, dists)]
     if not chunks:
+        if debug is not None:
+            debug.update({
+                "pre_llm_candidates": [],
+                "doc_code_boosts": [],
+                "reranker": {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": True},
+                "post_rerank_hits": [],
+                "timing_ms": {"retrieve": retrieve_ms, "rerank": 0},
+            })
         return []
 
-    # --- Metadata-aware boosting ---
-    def _tokens(s: str) -> List[str]:
-        return re.findall(r"\b\w+\b", (s or "").lower())
-
-    q_tokens = set(_tokens(query))
-    for ch in chunks:
-        meta = ch.get("meta") or {}
-        fields = []
-        cat = meta.get("category")
-        if cat:
-            fields.append(cat)
-        title = meta.get("title")
-        if title:
-            fields.append(title)
-        kws = meta.get("keywords")
-        if kws:
-            if isinstance(kws, list):
-                fields.extend(kws)
-            else:
-                fields.append(kws)
-
-        meta_tokens = set()
-        for f in fields:
-            meta_tokens.update(_tokens(str(f)))
-
-        matches = 0
-        for qt in q_tokens:
-            if qt in meta_tokens:
-                matches += 1
-            else:
-                for mt in meta_tokens:
-                    if difflib.SequenceMatcher(None, qt, mt).ratio() >= 0.8:
-                        matches += 1
-                        break
-
-        if matches:
-            ch["score"] *= 1 + 0.1 * matches
+    doc_boosts: List[Dict[str, Any]] = []
+    _apply_metadata_boost(query, chunks, doc_boosts)
 
     chunks.sort(key=lambda x: x["score"], reverse=True)
+    pre_llm = [dict(ch) for ch in chunks]
+    if debug is not None:
+        debug["pre_llm_candidates"] = []
+        for i, ch in enumerate(pre_llm, 1):
+            meta = ch.get("meta") or {}
+            debug["pre_llm_candidates"].append({
+                "index": i,
+                "score_pre": ch.get("score"),
+                "doc_code": meta.get("doc_code"),
+                "title": meta.get("title"),
+                "category": meta.get("category"),
+                "revision_date": meta.get("revision_date"),
+                "sp_web_url": meta.get("sp_web_url"),
+                "snippet": _truncate(ch.get("text") or ch.get("snippet"), 280),
+            })
+        debug["doc_code_boosts"] = doc_boosts
 
-    snippet_lines = []
-    for i, ch in enumerate(chunks, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-
-    user_prompt = (
-        f"Query: {query}\n\n" +
-        "\n".join(snippet_lines) +
-        "\n\nFor each chunk, provide a relevance score from 0 to 3 in the format 'index: score', comma-separated."
-    )
-
-    messages = [
-        {"role": "system", "content": "You score chunks by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
-
+    texts = []
+    for ch in chunks:
+        t = _get_text_for_hit(ch)
+        texts.append(t[:4000])
+    start_rerank = _now_ms()
+    rerank_fallback_used = False
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": reranker_model_name,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            text = (r.json().get("message") or {}).get("content", "")
-            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
-            for idx_s, score_s in pairs:
-                idx = int(idx_s)
-                if 1 <= idx <= len(chunks):
-                    chunks[idx - 1]["score"] = float(score_s)
-            for ch in chunks:
-                ch.setdefault("score", 0.0)
-            chunks.sort(key=lambda x: x["score"], reverse=True)
-            filtered = [ch for ch in chunks if ch["score"] >= 1.5][:3]
-            if not filtered:
-                print("All reranked scores below threshold")
-                return []
-            return filtered
+        bge_scores = _bge_score_pairs(query, texts)
+        for ch, s in zip(chunks, bge_scores):
+            ch["score"] = float(s) * ch.get("_boost", 1.0)
     except Exception as e:
         print("Hybrid rerank failed:", e)
-    return chunks[:3]
+        rerank_fallback_used = True
+        for ch in chunks:
+            ch["score"] = ch.get("score", 0.0)
+    chunks.sort(key=lambda x: x["score"], reverse=True)
+    result = chunks[:final_k] if chunks else []
+    rerank_ms = _now_ms() - start_rerank
+
+    if debug is not None:
+        debug["reranker"] = {
+            "raw_text": "",
+            "parsed": [{"index": i + 1, "score": h.get("score")} for i, h in enumerate(result)],
+            "threshold": 0.0,
+            "fallback_used": rerank_fallback_used,
+        }
+        debug["post_rerank_hits"] = []
+        for i, h in enumerate(result, 1):
+            meta = h.get("meta") or {}
+            debug["post_rerank_hits"].append({
+                "index": i,
+                "score": h.get("score"),
+                "doc_code": meta.get("doc_code"),
+                "title": meta.get("title"),
+                "snippet": _truncate(h.get("text") or h.get("snippet"), 280),
+            })
+        debug["timing_ms"] = {"retrieve": retrieve_ms, "rerank": rerank_ms}
+
+    return result
 
 
-def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rerank retrieved chunks using Mistral based on relevance to the question."""
+
+
+def rerank_sources(question: str, chunks: List[Dict[str, Any]],
+                   debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Rerank retrieved chunks using local BGE scoring."""
     if not chunks:
+        if debug is not None:
+            debug["reranker"] = {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": True}
         return []
-    top = chunks[:10]
-    prompt_lines = [
-        f"Given the question: {question}",
-        "Rank the following snippets in order of relevance to the question.",
-        "Respond with a comma-separated list of snippet numbers in ranked order.",
-        "Snippets:"
-    ]
-    snippet_lines = []
-    for i, ch in enumerate(top, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-    user_prompt = "\n".join(prompt_lines + snippet_lines)
 
-    messages = [
-        {"role": "system", "content": "You rank text snippets by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
+    doc_boosts: List[Dict[str, Any]] = []
+    _apply_metadata_boost(question, chunks, doc_boosts)
+    texts = []
+    for ch in chunks:
+        t = _get_text_for_hit(ch)
+        texts.append(t[:4000])
+    fallback_used = False
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": "mistral-7b-instruct",
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            text = (r.json().get("message") or {}).get("content", "")
-            order = [int(n) for n in re.findall(r"\d+", text) if 1 <= int(n) <= len(top)]
-            ranked = [top[i - 1] for i in order if 1 <= i <= len(top)]
-            ranked += [top[i] for i in range(len(top)) if (i + 1) not in order]
-            return ranked[:5]
+        scores = _bge_score_pairs(question, texts)
+        for ch, s in zip(chunks, scores):
+            ch["score"] = float(s) * ch.get("_boost", 1.0)
     except Exception as e:
         print("Rerank failed:", e)
-    return top[:5]
+        fallback_used = True
+        for ch in chunks:
+            ch["score"] = ch.get("score", 0.0)
 
+    chunks.sort(key=lambda x: x["score"], reverse=True)
+    top = chunks[:3]
 
-def rerank_sources(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rerank retrieved chunks using Mistral and filter by score."""
-    if not chunks:
-        return []
-    top = chunks[:10]
-    prompt_lines = [
-        f"Given the question: {question}",
-        "Score the following snippets for relevance on a 0-3 scale.",
-        "Return comma-separated 'index: score' pairs.",
-        "Snippets:",
-    ]
-    snippet_lines = []
-    for i, ch in enumerate(top, 1):
-        snippet = (ch.get("text") or "")[:200].replace("\n", " ")
-        snippet_lines.append(f"{i}. {snippet}")
-    user_prompt = "\n".join(prompt_lines + snippet_lines)
-
-    messages = [
-        {"role": "system", "content": "You score text snippets by relevance."},
-        {"role": "user", "content": user_prompt},
-    ]
-    try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": "mistral-7b-instruct",
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0},
-                "keep_alive": OLLAMA_KEEP_ALIVE,
+    if debug is not None:
+        debug.update({
+            "doc_code_boosts": doc_boosts,
+            "reranker": {
+                "raw_text": "",
+                "parsed": [{"index": i + 1, "score": h.get("score")} for i, h in enumerate(top)],
+                "threshold": 0.0,
+                "fallback_used": fallback_used,
             },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            text = (r.json().get("message") or {}).get("content", "")
-            pairs = re.findall(r"(\d+)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
-            for idx_s, score_s in pairs:
-                idx = int(idx_s)
-                if 1 <= idx <= len(top):
-                    top[idx - 1]["score"] = float(score_s)
-            for ch in top:
-                ch.setdefault("score", 0.0)
-            top.sort(key=lambda x: x["score"], reverse=True)
-            filtered = [ch for ch in top if ch["score"] >= 1.5][:3]
-            if not filtered:
-                print("All reranked scores below threshold")
-                return []
-            return filtered
-    except Exception as e:
-        print("Rerank failed:", e)
-    return top[:3]
+        })
+    return top
 
 
 def _dehedge(text: str) -> str:
@@ -815,7 +828,9 @@ def _dehedge(text: str) -> str:
         text = re.sub(p, "", text, count=1)
     return text.strip()
 
-def ask_with_context(question: str, hits: List[dict], chat_history: Optional[List[dict]] = None, model: Optional[str] = None) -> str:
+def ask_with_context(question: str, hits: List[dict], chat_history: Optional[List[dict]] = None,
+                     model: Optional[str] = None, force_citations: bool = False,
+                     extra_system_prompt: str = "") -> str:
     ql = (question or "").lower()
 
     meta_triggers = [
@@ -826,15 +841,25 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
     if any(t in ql for t in meta_triggers):
         return "I am Adam - the Amentum Document and Assistance Model (ADAM)."
 
-    context = "\n\n".join([f"[{i+1}] {h['text']}" for i, h in enumerate(hits)])
+    context = "\n\n".join([f"[{h.get('index', i+1)}] {h['text']}" for i, h in enumerate(hits)])
 
     sys_prompt = (
         "You are Adam — the Amentum Document and Assistance Model (ADAM). "
         "Answer directly and succinctly. Do not start with phrases like "
         "'According to the provided context'. Use ONLY the provided context for factual claims and insert "
         "inline bracket citations like [1], [2] right after the sentence they support. "
-        "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know."
+        "Do not append a 'Sources:' section. If the answer is not in the context, say you do not know. "
+        "CITATION RULES: Use only numeric bracket citations that correspond to the provided context blocks, e.g., [1], [2]. "
+        "Do not use section numbers like [4.1], ranges like [1-3], or textual citations. Put the citation immediately after each claim it supports. "
+        "COMPLETENESS RULES: If the user asks about definitions, boundaries, windows, or procedures, include all relevant elements present in the context (e.g., start and end times, total hours, tool/system names). "
+        "NO FABRICATION: If a claim cannot be supported with a bracket citation from the context, say you do not know. "
+        "OUTPUT FORMAT (HTML ONLY): Respond with a well-formed HTML fragment (not a full <html> page). Use <p> for paragraphs (each sentence starts with a capital letter). <ul> / <ol> with <li> for lists of steps or bullets. <table><thead>…</thead><tbody>…</tbody></table> for side-by-side facts. <strong>, <em>, <code>, <sup> as needed. CITATIONS: Put bracket citations inline at the end of the clause they support as <sup>[n]</sup>. Only use numbers that map to the provided context blocks. STYLE & SAFETY: Do not include <script>, inline CSS, external images, or arbitrary attributes. No markdown; HTML only. COMPLETENESS: For definition/boundary/steps questions, include all relevant elements present in the context (e.g., start and end times, total hours, and system/tool names). "
+        "Direct answer in one sentence. One short follow-up sentence with any missing critical detail (e.g., 'begins Friday 12:00 noon and ends next Friday 11:59 a.m.'). Include the bracket citations inline."
     )
+    if force_citations:
+        sys_prompt += " You MUST include at least one citation if you answer. If unsure, say you do not know."
+    if extra_system_prompt:
+        sys_prompt += " " + extra_system_prompt
 
     messages = [{"role": "system", "content": sys_prompt}]
     if chat_history:
@@ -885,26 +910,137 @@ def ask_with_context(question: str, hits: List[dict], chat_history: Optional[Lis
 
 
 def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return only chunks whose text shares keywords with the answer and are cited."""
+    """Return chunks that are explicitly cited in the answer."""
     if not answer or not chunks:
         return []
     used = {int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()}
     if not used:
         return []
-    answer_words = set(re.findall(r"\b\w{4,}\b", answer.lower()))
-    filtered = []
+    ordered = []
     for ch in chunks:
-        idx = ch.get("index")
-        if idx not in used:
+        if ch.get("index") in used:
+            ordered.append(ch)
+    return ordered
+
+
+def _extract_numeric_citations(answer: str, max_index: int) -> Tuple[Set[int], bool]:
+    brackets = re.findall(r"\[([^\]]+)\]", answer or "")
+    used: Set[int] = set()
+    valid = True
+    for b in brackets:
+        if not b.isdigit():
+            valid = False
             continue
-        snippet_words = set(re.findall(r"\b\w{4,}\b", (ch.get("text") or "").lower()))
-        if len(answer_words & snippet_words) >= 3:
-            filtered.append(ch)
-    return filtered
+        idx = int(b)
+        if idx < 1 or idx > max_index:
+            valid = False
+        else:
+            used.add(idx)
+    return used, valid
+
+
+def _ensure_html(text: str) -> Tuple[str, bool, List[str]]:
+    tags = [t.lower() for t in re.findall(r"<\s*([a-zA-Z0-9]+)", text or "")]
+    is_html = bool(tags)
+    if not any(t in ("p", "ul", "ol", "table") for t in tags):
+        t = (text or "").strip()
+        if t:
+            t = t[0].upper() + t[1:]
+        text = f"<p>{t}</p>"
+        tags = ["p"]
+        is_html = True
+    tag_summary = sorted({t for t in tags})
+    return text, is_html, tag_summary
+
+
+def _ensure_doc_code(meta: Dict[str, Any]) -> None:
+    if meta.get("doc_code"):
+        return
+    url = meta.get("sp_web_url") or meta.get("path") or ""
+    m = re.search(r"([A-Za-z]{2,}-[A-Za-z]{2,}-[A-Za-z]{2,}-\d{3,5})", url)
+    if m:
+        meta["doc_code"] = m.group(1)
+
+
+def _apply_metadata_boost(query: str, chunks: List[Dict[str, Any]], doc_boosts: Optional[List[Dict[str, Any]]] = None) -> None:
+    def _tokens(s: str) -> List[str]:
+        return re.findall(r"\b\w+\b", (s or "").lower())
+
+    q_tokens = set(_tokens(query))
+    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+    query_codes = {c.lower() for c in code_pat.findall(query)}
+    if doc_boosts is None:
+        doc_boosts = []
+    for idx, ch in enumerate(chunks, 1):
+        meta = ch.get("meta") or {}
+        _ensure_doc_code(meta)
+        fields = []
+        cat = meta.get("category")
+        if cat:
+            fields.append(cat)
+        title = meta.get("title")
+        if title:
+            fields.append(title)
+        kws = meta.get("keywords")
+        if kws:
+            if isinstance(kws, list):
+                fields.extend(kws)
+            else:
+                fields.append(kws)
+        doc_code = meta.get("doc_code")
+        if doc_code:
+            fields.append(doc_code)
+        version = meta.get("version")
+        if version:
+            fields.append(str(version))
+        rev_date = meta.get("revision_date")
+        if rev_date:
+            fields.append(str(rev_date))
+
+        meta_tokens = set()
+        for f in fields:
+            meta_tokens.update(_tokens(str(f)))
+
+        matches = 0
+        for qt in q_tokens:
+            if qt in meta_tokens:
+                matches += 1
+            else:
+                for mt in meta_tokens:
+                    if difflib.SequenceMatcher(None, qt, mt).ratio() >= 0.8:
+                        matches += 1
+                        break
+
+        boost = 1.0
+        if matches:
+            boost *= 1 + 0.1 * matches
+        if doc_code:
+            dc = str(doc_code).lower()
+            for qc in query_codes:
+                if dc == qc:
+                    boost *= 3.0
+                    doc_boosts.append({"index": idx, "reason": "exact", "multiplier": 3.0})
+                    break
+                norm_dc = dc.replace("-", "")
+                norm_qc = qc.replace("-", "")
+                if norm_dc == norm_qc or difflib.SequenceMatcher(None, norm_dc, norm_qc).ratio() >= 0.9:
+                    boost *= 2.0
+                    doc_boosts.append({"index": idx, "reason": "fuzzy", "multiplier": 2.0})
+                    break
+        if (meta.get("category") or "").lower() == "policy":
+            boost *= 1.15
+        t = (meta.get("title") or "").lower()
+        if any(k in t for k in ["workweek", "work week", "work hours", "timekeeping", "pto", "decisions tool"]):
+            boost *= 1.10
+        ch.setdefault("_boost", boost)
+        ch["score"] *= boost
 
 def rewrite_prompt(prompt: str) -> str:
     """Use Mistral to safely rewrite vague prompts, without changing intent."""
     try:
+        code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+        codes = code_pat.findall(prompt)
+
         messages = [
             {
                 "role": "system",
@@ -916,7 +1052,7 @@ def rewrite_prompt(prompt: str) -> str:
             },
             {
                 "role": "user",
-                "content": f"Original query: {prompt}\n\nRewritten query:"
+                "content": f"Original query: {prompt}\n\nRewritten query:",
             }
         ]
 
@@ -935,10 +1071,19 @@ def rewrite_prompt(prompt: str) -> str:
         if r.status_code == 200:
             j = r.json()
             rewritten = (j.get("message") or {}).get("content", "").strip()
-
-            # Basic sanity check: don't allow rewrites that lose all original keywords
-            if rewritten and any(word.lower() in rewritten.lower() for word in prompt.split()):
-                return rewritten
+            if rewritten:
+                for c in codes:
+                    if c not in rewritten:
+                        rewritten = (rewritten + " " + c).strip()
+                orig_lower = prompt.lower()
+                rew_lower = rewritten.lower()
+                keywords = ["workweek", "work week", "pto", "decisions tool", "timekeeping"]
+                for kw in keywords:
+                    if kw in orig_lower and kw not in rew_lower:
+                        rewritten = (rewritten + " " + kw).strip()
+                        rew_lower = rewritten.lower()
+                if not codes or all(c in rewritten for c in codes):
+                    return rewritten
 
         return prompt  # fallback if empty or invalid rewrite
     except Exception as e:
@@ -968,8 +1113,46 @@ class QueryResponse(BaseModel):
     prompt_rewritten: bool
 
 
+# Quick smoke tests:
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "When does the standard workweek begin and end?"}'
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "Per CLG-EN-PO-0301, where do I submit PTO?"}'
+# curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
+#   -d '{"query": "What is the weather on Mars?"}'
+
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
+    start_total = _now_ms()
+    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+    debug = {
+        "request_id": str(uuid.uuid4()),
+        "timestamp_ms": _now_ms(),
+        "endpoint": "/query",
+        "model": {"generator": resolve_model(body.model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
+        "query": {
+            "original": body.query,
+            "rewritten": "",
+            "prompt_rewritten": False,
+            "doc_codes_original": code_pat.findall(body.query),
+            "doc_codes_rewritten": [],
+        },
+        "retrieval": {"where": None},
+        "answering": {
+            "first_pass": {"answer": "", "citations": [], "timing_ms": 0},
+            "second_pass_invoked": False,
+            "second_pass": {"answer": "", "citations": [], "timing_ms": 0},
+            "final": {
+                "answer_used": "",
+                "filtered_sources": [],
+                "fallback_reason": "none",
+                "answer_is_html": False,
+                "html_tag_summary": [],
+            },
+        },
+        "total_time_ms": 0,
+    }
+
     if body.rewrite:
         rewritten_query_raw = rewrite_prompt(body.query).strip()
         m = re.search(r"Rewritten Query:\s*(.*)", rewritten_query_raw, re.DOTALL)
@@ -984,6 +1167,9 @@ def query_api(body: QueryBody) -> QueryResponse:
     else:
         rewritten_query = body.query
         prompt_rewritten = False
+    debug["query"]["rewritten"] = rewritten_query
+    debug["query"]["prompt_rewritten"] = prompt_rewritten
+    debug["query"]["doc_codes_rewritten"] = code_pat.findall(rewritten_query)
 
     where: Optional[Dict[str, Any]] = None
     if body.org or body.category or body.doc_code or body.owner:
@@ -996,23 +1182,159 @@ def query_api(body: QueryBody) -> QueryResponse:
             where["doc_code"] = body.doc_code
         if body.owner:
             where["owner"] = body.owner
+    debug["retrieval"]["where"] = where
 
-    hits = hybrid_rerank(rewritten_query, retriever, "llama3:8b", where=where)
-    if not hits:
+    rdebug: Dict[str, Any] = {}
+    top_hits = hybrid_rerank(rewritten_query, retriever, "bge-reranker-v2-m3", where=where, debug=rdebug)
+    debug["retrieval"].update(rdebug)
+    if not top_hits:
+        final_answer = "I'm sorry, I couldn't find relevant information."
+        final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_hits_after_rerank",
+            "answer_is_html": is_html_final,
+            "html_tag_summary": tags_final,
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
         return QueryResponse(
-            answer="I'm sorry, I couldn't find relevant information.",
+            answer=final_answer,
             sources=[],
             original_query=body.query,
             rewritten_query=rewritten_query,
             prompt_rewritten=prompt_rewritten,
         )
-    for idx, h in enumerate(hits, 1):
-        h["index"] = idx
+    blocks: List[Dict[str, Any]] = []
+    for i, h in enumerate(top_hits, start=1):
+        t = _get_text_for_hit(h)
+        if not t:
+            continue
+        h["text"] = t
+        h["index"] = len(blocks) + 1
+        blocks.append({"index": h["index"], "text": t, "hit": h})
 
-    answer = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
+    if not blocks:
+        for i, h in enumerate(top_hits, start=1):
+            t = _get_text_for_hit(h)
+            if t:
+                h["text"] = t
+                h["index"] = len(blocks) + 1
+                blocks.append({"index": h["index"], "text": t, "hit": h})
+            if len(blocks) >= 3:
+                break
+
+    hits = [b["hit"] for b in blocks]
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": b["index"],
+            "chars": len(b["text"]),
+            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
+        }
+        for b in blocks
+    ])
+
+    if not blocks:
+        final_answer = (
+            "<p>I couldn't load readable text from the retrieved sources. "
+            "Please re-index the policy with a small text preview.</p>"
+        )
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_readable_text",
+            "answer_is_html": True,
+            "html_tag_summary": ["p"],
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
+        return QueryResponse(
+            answer=final_answer,
+            sources=[],
+            original_query=body.query,
+            rewritten_query=rewritten_query,
+            prompt_rewritten=prompt_rewritten,
+        )
+
+    start_ans = _now_ms()
+    answer_first = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
+    ans_time = _now_ms() - start_ans
+    answer_first, is_html_first, tags_first = _ensure_html(answer_first)
+    used_first, valid_first = _extract_numeric_citations(answer_first, len(hits))
+    citations_first = sorted(list(used_first))
+    debug["answering"]["first_pass"] = {
+        "answer": _truncate(answer_first, 1200),
+        "citations": citations_first,
+        "timing_ms": ans_time,
+    }
+    filtered = filter_cited_sources(answer_first, hits) if valid_first and used_first else []
+    answer_used = answer_first
+    is_html_final = is_html_first
+    tags_final = tags_first
+    if not valid_first or not filtered:
+        debug["answering"]["second_pass_invoked"] = True
+        extra = (
+            "Your previous answer used invalid citations (e.g., [4.1] or out-of-range). "
+            "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
+            "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
+            "Maintain completeness and sentence capitalization."
+        )
+        snippet_all = " ".join([h.get("text") or "" for h in hits])
+        if "12:00" in snippet_all and "11:59" in snippet_all:
+            extra += " Include both the start and end time and the total hours if mentioned."
+        start_second = _now_ms()
+        second = ask_with_context(
+            rewritten_query,
+            hits,
+            chat_history=body.history,
+            model=body.model,
+            force_citations=True,
+            extra_system_prompt=extra,
+        )
+        second_ms = _now_ms() - start_second
+        second, is_html_second, tags_second = _ensure_html(second)
+        used_second, valid_second = _extract_numeric_citations(second, len(hits))
+        citations_second = sorted(list(used_second))
+        debug["answering"]["second_pass"] = {
+            "answer": _truncate(second, 1200),
+            "citations": citations_second,
+            "timing_ms": second_ms,
+        }
+        if valid_second and citations_second:
+            filtered = filter_cited_sources(second, hits)
+            if filtered:
+                answer_used = second
+                is_html_final = is_html_second
+                tags_final = tags_second
+        if not filtered:
+            final_answer = "I'm sorry, I can't answer confidently from the provided sources."
+            final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+            debug["answering"]["final"].update({
+                "answer_used": _truncate(final_answer, 1200),
+                "filtered_sources": [],
+                "fallback_reason": "no_citations_after_second_pass",
+                "answer_is_html": is_html_final,
+                "html_tag_summary": tags_final,
+            })
+            debug["total_time_ms"] = _now_ms() - start_total
+            with _debug_lock:
+                _debug_buffer.append(debug)
+            return QueryResponse(
+                answer=final_answer,
+                sources=[],
+                original_query=body.query,
+                rewritten_query=rewritten_query,
+                prompt_rewritten=prompt_rewritten,
+            )
+    else:
+        debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
 
     rich = []
-    for h in hits:
+    for h in filtered:
         meta = h.get("meta", {}) or {}
         rich.append({
             "index": h.get("index"),
@@ -1025,11 +1347,31 @@ def query_api(body: QueryBody) -> QueryResponse:
             "sp_web_url": meta.get("sp_web_url"),
             "path": meta.get("path"),   # present for legacy local docs
             "score": h.get("score"),
-            "snippet": (h.get("text") or "")[:400],
+            "snippet": _get_text_for_hit(h)[:280],
         })
 
+    debug["answering"]["final"].update({
+        "answer_used": _truncate(answer_used, 1200),
+        "filtered_sources": [
+            {
+                "index": s["index"],
+                "doc_code": s["doc_code"],
+                "title": s["title"],
+                "sp_web_url": s["sp_web_url"],
+                "score": s["score"],
+                "snippet": _truncate(s["snippet"], 280),
+            }
+            for s in rich
+        ],
+        "answer_is_html": is_html_final,
+        "html_tag_summary": tags_final,
+    })
+    debug["total_time_ms"] = _now_ms() - start_total
+    with _debug_lock:
+        _debug_buffer.append(debug)
+
     return QueryResponse(
-        answer=answer,
+        answer=answer_used,
         sources=rich,
         original_query=body.query,
         rewritten_query=rewritten_query,
@@ -1338,6 +1680,7 @@ def search_filtered(
 
 @app.post("/query_path")
 def query_path(body: Dict[str, Any] = Body(...)):
+    start_total = _now_ms()
     query = body.get("query", "")
     k = int(body.get("k", 4))
     history = body.get("history")
@@ -1352,16 +1695,311 @@ def query_path(body: Dict[str, Any] = Body(...)):
     doc_code = body.get("doc_code")
     owner = body.get("owner")
 
-    hits = search_filtered(query, k=10, path=path, paths=paths, prefix=prefix, source=source,
-                           org=org, category=category, doc_code=doc_code, owner=owner)
-    hits = rerank_sources(query, hits)
-    if not hits:
-        return {"answer": "I'm sorry, I couldn't find relevant information.", "sources": []}
-    for idx, h in enumerate(hits, 1):
-        h["index"] = idx
-    answer = ask_with_context(query, hits, chat_history=history, model=model)
-    filtered = filter_cited_sources(answer, hits)
-    return {"answer": answer, "sources": filtered}
+    code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
+    where_filters = {}
+    if path:
+        where_filters["path"] = path
+    if paths:
+        where_filters["paths"] = paths
+    if prefix:
+        where_filters["prefix"] = prefix
+    if source:
+        where_filters["source"] = source
+    if org:
+        where_filters["org"] = org
+    if category:
+        where_filters["category"] = category
+    if doc_code:
+        where_filters["doc_code"] = doc_code
+    if owner:
+        where_filters["owner"] = owner
+
+    debug = {
+        "request_id": str(uuid.uuid4()),
+        "timestamp_ms": _now_ms(),
+        "endpoint": "/query_path",
+        "model": {"generator": resolve_model(model), "reranker": "bge-reranker-v2-m3 (transformers, local)"},
+        "query": {
+            "original": query,
+            "rewritten": query,
+            "prompt_rewritten": False,
+            "doc_codes_original": code_pat.findall(query),
+            "doc_codes_rewritten": code_pat.findall(query),
+        },
+        "retrieval": {"where": where_filters or None,
+                       "pre_llm_candidates": [],
+                       "doc_code_boosts": [],
+                       "reranker": {"raw_text": "", "parsed": [], "threshold": 0.0, "fallback_used": False},
+                       "post_rerank_hits": [],
+                       "timing_ms": {"retrieve": 0, "rerank": 0}},
+        "answering": {
+            "first_pass": {"answer": "", "citations": [], "timing_ms": 0},
+            "second_pass_invoked": False,
+            "second_pass": {"answer": "", "citations": [], "timing_ms": 0},
+            "final": {
+                "answer_used": "",
+                "filtered_sources": [],
+                "fallback_reason": "none",
+                "answer_is_html": False,
+                "html_tag_summary": [],
+            },
+        },
+        "total_time_ms": 0,
+    }
+
+    start_retrieve = _now_ms()
+    hits0 = search_filtered(query, k=10, path=path, paths=paths, prefix=prefix, source=source,
+                            org=org, category=category, doc_code=doc_code, owner=owner)
+    retrieve_ms = _now_ms() - start_retrieve
+    for i, ch in enumerate(hits0, 1):
+        meta = ch.get("meta") or {}
+        _ensure_doc_code(meta)
+        debug["retrieval"]["pre_llm_candidates"].append({
+            "index": i,
+            "score_pre": ch.get("score"),
+            "doc_code": meta.get("doc_code"),
+            "title": meta.get("title"),
+            "category": meta.get("category"),
+            "revision_date": meta.get("revision_date"),
+            "sp_web_url": meta.get("sp_web_url"),
+            "snippet": _truncate(ch.get("text") or ch.get("snippet"), 280),
+        })
+
+    rdebug: Dict[str, Any] = {}
+    start_rerank = _now_ms()
+    top_hits = rerank_sources(query, hits0, debug=rdebug)
+    rerank_ms = _now_ms() - start_rerank
+    debug["retrieval"].update(rdebug)
+    debug["retrieval"]["timing_ms"] = {"retrieve": retrieve_ms, "rerank": rerank_ms}
+    debug["retrieval"]["post_rerank_hits"] = [
+        {
+            "index": i + 1,
+            "score": h.get("score"),
+            "doc_code": (h.get("meta") or {}).get("doc_code"),
+            "title": (h.get("meta") or {}).get("title"),
+            "snippet": _truncate(_get_text_for_hit(h), 280),
+        }
+        for i, h in enumerate(top_hits)
+    ]
+
+    if not top_hits:
+        final_answer = "I'm sorry, I couldn't find relevant information."
+        final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_hits_after_rerank",
+            "answer_is_html": is_html_final,
+            "html_tag_summary": tags_final,
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
+        return {"answer": final_answer, "sources": []}
+
+    blocks: List[Dict[str, Any]] = []
+    for i, h in enumerate(top_hits, start=1):
+        t = _get_text_for_hit(h)
+        if not t:
+            continue
+        h["text"] = t
+        h["index"] = len(blocks) + 1
+        blocks.append({"index": h["index"], "text": t, "hit": h})
+
+    if not blocks:
+        for i, h in enumerate(top_hits, start=1):
+            t = _get_text_for_hit(h)
+            if t:
+                h["text"] = t
+                h["index"] = len(blocks) + 1
+                blocks.append({"index": h["index"], "text": t, "hit": h})
+            if len(blocks) >= 3:
+                break
+
+    hits = [b["hit"] for b in blocks]
+
+    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
+        {
+            "index": b["index"],
+            "chars": len(b["text"]),
+            "preview": b["text"][:120] + ("\u2026" if len(b["text"]) > 120 else ""),
+        }
+        for b in blocks
+    ])
+
+    if not blocks:
+        final_answer = (
+            "<p>I couldn't load readable text from the retrieved sources. Please re-index the policy with a small text preview.</p>"
+        )
+        debug["answering"]["final"].update({
+            "answer_used": _truncate(final_answer, 1200),
+            "filtered_sources": [],
+            "fallback_reason": "no_readable_text",
+            "answer_is_html": True,
+            "html_tag_summary": ["p"],
+        })
+        debug["total_time_ms"] = _now_ms() - start_total
+        with _debug_lock:
+            _debug_buffer.append(debug)
+        return {"answer": final_answer, "sources": []}
+
+    start_ans = _now_ms()
+    answer_first = ask_with_context(query, hits, chat_history=history, model=model)
+    ans_ms = _now_ms() - start_ans
+    answer_first, is_html_first, tags_first = _ensure_html(answer_first)
+    used_first, valid_first = _extract_numeric_citations(answer_first, len(hits))
+    citations_first = sorted(list(used_first))
+    debug["answering"]["first_pass"] = {
+        "answer": _truncate(answer_first, 1200),
+        "citations": citations_first,
+        "timing_ms": ans_ms,
+    }
+    filtered = filter_cited_sources(answer_first, hits) if valid_first and used_first else []
+    answer_used = answer_first
+    is_html_final = is_html_first
+    tags_final = tags_first
+    if not valid_first or not filtered:
+        debug["answering"]["second_pass_invoked"] = True
+        extra = (
+            "Your previous answer used invalid citations (e.g., [4.1] or out-of-range). "
+            "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
+            "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
+            "Maintain completeness and sentence capitalization."
+        )
+        snippet_all = " ".join([h.get("text") or "" for h in hits])
+        if "12:00" in snippet_all and "11:59" in snippet_all:
+            extra += " Include both the start and end time and the total hours if mentioned."
+        start_second = _now_ms()
+        second = ask_with_context(
+            query,
+            hits,
+            chat_history=history,
+            model=model,
+            force_citations=True,
+            extra_system_prompt=extra,
+        )
+        second_ms = _now_ms() - start_second
+        second, is_html_second, tags_second = _ensure_html(second)
+        used_second, valid_second = _extract_numeric_citations(second, len(hits))
+        citations_second = sorted(list(used_second))
+        debug["answering"]["second_pass"] = {
+            "answer": _truncate(second, 1200),
+            "citations": citations_second,
+            "timing_ms": second_ms,
+        }
+        if valid_second and citations_second:
+            filtered = filter_cited_sources(second, hits)
+            if filtered:
+                answer_used = second
+                is_html_final = is_html_second
+                tags_final = tags_second
+        if not filtered:
+            final_answer = "I'm sorry, I can't answer confidently from the provided sources."
+            final_answer, is_html_final, tags_final = _ensure_html(final_answer)
+            debug["answering"]["final"].update({
+                "answer_used": _truncate(final_answer, 1200),
+                "filtered_sources": [],
+                "fallback_reason": "no_citations_after_second_pass",
+                "answer_is_html": is_html_final,
+                "html_tag_summary": tags_final,
+            })
+            debug["total_time_ms"] = _now_ms() - start_total
+            with _debug_lock:
+                _debug_buffer.append(debug)
+            return {"answer": final_answer, "sources": []}
+    else:
+        debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
+    for h in filtered:
+        h["snippet"] = _get_text_for_hit(h)[:280]
+
+    debug["answering"]["final"].update({
+        "answer_used": _truncate(answer_used, 1200),
+        "filtered_sources": [
+            {
+                "index": h.get("index"),
+                "doc_code": (h.get("meta") or {}).get("doc_code"),
+                "title": (h.get("meta") or {}).get("title"),
+                "sp_web_url": (h.get("meta") or {}).get("sp_web_url"),
+                "score": h.get("score"),
+                "snippet": _truncate(h.get("snippet"), 280),
+            }
+            for h in filtered
+        ],
+        "answer_is_html": is_html_final,
+        "html_tag_summary": tags_final,
+    })
+    debug["total_time_ms"] = _now_ms() - start_total
+    with _debug_lock:
+        _debug_buffer.append(debug)
+
+    return {"answer": answer_used, "sources": filtered}
+
+
+# Latest record (without snippets)
+# curl -s http://localhost:8000/debug_last | jq .
+#
+# Latest with snippets (truncate to 400 chars)
+# curl -s "http://localhost:8000/debug_last?include_snippets=true&max_chars=400" | jq .
+#
+# Third most recent
+# curl -s "http://localhost:8000/debug_last?index=-3" | jq .
+#
+# With auth (if DEBUG_API_KEY=secret123 is set)
+# curl -s -H "X-Debug-Key: secret123" "http://localhost:8000/debug_last?include_snippets=true" | jq .
+
+
+@app.get("/debug_last")
+def debug_last(index: int = -1,
+               include_snippets: bool = False,
+               max_chars: int = 280,
+               x_debug_key: Optional[str] = Header(default=None)):
+    if _DEBUG_API_KEY and x_debug_key != _DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    count = len(_debug_buffer)
+    if count == 0:
+        return {"count": 0, "index": None, "record": None}
+    if index < 0:
+        idx = count + index
+    else:
+        idx = index
+    if idx < 0 or idx >= count:
+        raise HTTPException(status_code=400, detail="index out of range")
+    record = _debug_buffer[idx]
+    rec = json.loads(json.dumps(record))
+
+    def sanitize(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    out[k] = sanitize(v)
+                elif isinstance(v, str):
+                    if include_snippets:
+                        out[k] = _truncate(v, max_chars)
+                    else:
+                        out[k] = "" if k in ("snippet", "answer", "raw_text", "answer_used") else v
+                else:
+                    out[k] = v
+            return out
+        elif isinstance(obj, list):
+            return [sanitize(x) for x in obj]
+        elif isinstance(obj, str):
+            return _truncate(obj, max_chars) if include_snippets else obj
+        else:
+            return obj
+
+    rec = sanitize(rec)
+    return {"count": count, "index": idx, "record": rec}
+
+
+@app.post("/debug_last/clear")
+def debug_last_clear(x_debug_key: Optional[str] = Header(default=None)):
+    if _DEBUG_API_KEY and x_debug_key != _DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    with _debug_lock:
+        cnt = len(_debug_buffer)
+        _debug_buffer.clear()
+    return {"cleared": cnt}
 
 
 # ---------------- New: Pydantic model for SharePoint ingest ----------------
