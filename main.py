@@ -57,6 +57,7 @@ import onnxruntime as ort
 from tokenizers import Tokenizer
 import numpy as np
 
+#comment for commit 
 class NomicOnnxEmbedder:
     """
     ONNXRuntime wrapper for nomic-ai/nomic-embed-text local model.
