@@ -34,6 +34,19 @@ from pydantic import BaseModel
 # ---------------- Vector DB ----------------
 import chromadb
 
+# ---------------- Semantic RAG pipeline ----------------
+from config import settings
+from adampy.services.ollama_client import OllamaClient
+from adampy.pipeline.semantic_rag import (
+    generate_query_variants,
+    dense_retrieve,
+    rrf_fuse,
+    load_reranker_or_reuse,
+    rerank,
+    build_grounded_answer,
+)
+from adampy.pipeline.citations import validate_and_fix_citations
+
 # ---------------- File watching ----------------
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -1143,6 +1156,104 @@ class QueryResponse(BaseModel):
     original_query: str
     rewritten_query: str
     prompt_rewritten: bool
+    alt_queries: List[str] = []
+    hyde_prompt: Optional[str] = None
+    retrieval_runs: List[Dict[str, Any]] = []
+    fusion: List[Dict[str, Any]] = []
+    rerank: List[Dict[str, Any]] = []
+    final_context: List[Dict[str, Any]] = []
+    phantom_citations_found: bool = False
+    phantom_citation_details: List[Any] = []
+
+
+def semantic_query(body: QueryBody) -> QueryResponse:
+    ollama = OllamaClient()
+    variants = (
+        generate_query_variants(
+            ollama,
+            body.query,
+            settings.SEMRAG_VARIANTS,
+            settings.SEMRAG_USE_HYDE,
+        )
+        if body.rewrite
+        else {"rewritten": None, "alternates": [], "hyde": None}
+    )
+
+    query_set = [body.query]
+    if variants.get("rewritten"):
+        query_set.append(variants["rewritten"])
+    query_set += variants.get("alternates", [])[: settings.SEMRAG_VARIANTS]
+    if settings.SEMRAG_USE_HYDE and variants.get("hyde"):
+        query_set.append(variants["hyde"])
+
+    retrieved_runs = []
+    per_query_results = []
+    for q in query_set:
+        hits = dense_retrieve(retriever, q, settings.SEMRAG_K_PER_VARIANT)
+        retrieved_runs.append(
+            {
+                "query": q,
+                "k": settings.SEMRAG_K_PER_VARIANT,
+                "results": [
+                    {
+                        "doc_id": p.doc_id,
+                        "chunk_id": p.chunk_id,
+                        "score_dense": p.score_dense,
+                        "rank": i + 1,
+                        "title": p.title,
+                        "url": p.url,
+                        "section_heading": p.section_heading,
+                        "page_num": p.page_num,
+                    }
+                    for i, p in enumerate(hits)
+                ],
+            }
+        )
+        per_query_results.append(hits)
+
+    fused = rrf_fuse(per_query_results, settings.SEMRAG_RRF_CUTOFF)
+    fusion_logs = [
+        {
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "rrf_score": p.rrf_score,
+            "fused_rank": i + 1,
+        }
+        for i, p in enumerate(fused)
+    ]
+
+    reranker = load_reranker_or_reuse()
+    reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
+    rerank_logs = [
+        {
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "rerank_score": p.rerank_score,
+            "rerank_rank": i + 1,
+        }
+        for i, p in enumerate(reranked)
+    ]
+
+    answer_raw, final_context = build_grounded_answer(ollama, body.query, reranked)
+    final_text, phantom_found, phantom_details = validate_and_fix_citations(
+        answer_raw, reranked
+    )
+
+    return QueryResponse(
+        answer=final_text,
+        sources=final_context,
+        original_query=body.query,
+        rewritten_query=variants.get("rewritten") or body.query,
+        prompt_rewritten=bool(variants.get("rewritten")) and body.rewrite,
+        alt_queries=variants.get("alternates", []),
+        hyde_prompt=variants.get("hyde"),
+        retrieval_runs=retrieved_runs,
+        fusion=fusion_logs,
+        rerank=rerank_logs,
+        final_context=final_context,
+        phantom_citations_found=phantom_found,
+        phantom_citation_details=phantom_details,
+    )
 
 
 # Quick smoke tests:
@@ -1155,6 +1266,8 @@ class QueryResponse(BaseModel):
 
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
+    if settings.SEMRAG_ENABLED:
+        return semantic_query(body)
     start_total = _now_ms()
     code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
     debug = {
