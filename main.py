@@ -276,8 +276,11 @@ class _ChromaEmbedder:
     def __init__(self, embedder: NomicOnnxEmbedder):
         self._embedder = embedder
 
-    def __call__(self, texts: List[str]) -> List[List[float]]:
-        return self.embed_documents(texts)
+    # Chroma 0.5+ expects the __call__ signature to use the parameter name
+    # "input". Older versions accepted "texts", so keep the body identical
+    # but rename the argument to satisfy the validator.
+    def __call__(self, input: List[str]) -> List[List[float]]:  # type: ignore[override]
+        return self.embed_documents(input)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         return self._embedder.encode(texts, normalize_embeddings=True)
