@@ -1,8 +1,10 @@
-try:
-    from config import settings
-except ModuleNotFoundError:
-    # fallback if app is installed as a package 'app'
-    from app.config import settings
+# --- import path shim (ensures /srv/rag/app is importable even under systemd) ---
+import os, sys
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))  # /srv/rag/app
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+# --- end shim ---
+
 
 import sys
 import pysqlite3
