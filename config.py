@@ -14,11 +14,16 @@ if BaseSettings:
         SEMRAG_RRF_CUTOFF: int = 100
         SEMRAG_RERANK_KEEP: int = 15
         SEMRAG_USE_HYDE: bool = False
+
         OLLAMA_HOST: str = "http://127.0.0.1:11434"
         RERANKER_MODEL_PATH: str = "/opt/rag-models/bge-reranker-v2-m3"
         RERANKER_BATCH_SIZE: int = 16
         RERANKER_MAX_LEN: int = 512
+
         STRICT_CITATION_CHECKS: bool = True
+
+        # NEW: UI display cap for citations/sources (does not affect retrieval)
+        DISPLAY_TOP_K_DEFAULT: int = 5
 
         class Config:
             env_prefix = ""
@@ -35,14 +40,19 @@ else:
     class Settings:
         SEMRAG_ENABLED: bool = _get_bool("SEMRAG_ENABLED", True)
         SEMRAG_VARIANTS: int = _get_int("SEMRAG_VARIANTS", 2)
-        SEMRAG_K_PER_VARIANT: int = _get_int("SEMRAG_K_PER_VARIANT", 10)
-        SEMRAG_RRF_CUTOFF: int = _get_int("SEMRAG_RRF_CUTOFF", 50)
-        SEMRAG_RERANK_KEEP: int = _get_int("SEMRAG_RERANK_KEEP", 10)
+        SEMRAG_K_PER_VARIANT: int = _get_int("SEMRAG_K_PER_VARIANT", 20)
+        SEMRAG_RRF_CUTOFF: int = _get_int("SEMRAG_RRF_CUTOFF", 100)
+        SEMRAG_RERANK_KEEP: int = _get_int("SEMRAG_RERANK_KEEP", 15)
         SEMRAG_USE_HYDE: bool = _get_bool("SEMRAG_USE_HYDE", False)
+
         OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
         RERANKER_MODEL_PATH: str = os.getenv("RERANKER_MODEL_PATH", "/opt/rag-models/bge-reranker-v2-m3")
         RERANKER_BATCH_SIZE: int = _get_int("RERANKER_BATCH_SIZE", 16)
         RERANKER_MAX_LEN: int = _get_int("RERANKER_MAX_LEN", 512)
+
         STRICT_CITATION_CHECKS: bool = _get_bool("STRICT_CITATION_CHECKS", True)
+
+        # NEW
+        DISPLAY_TOP_K_DEFAULT: int = _get_int("DISPLAY_TOP_K_DEFAULT", 5)
 
     settings = Settings()
