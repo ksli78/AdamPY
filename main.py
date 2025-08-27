@@ -35,7 +35,10 @@ from pydantic import BaseModel
 import chromadb
 
 # ---------------- Semantic RAG pipeline ----------------
-from config import settings
+try:  # Allow running as "python main.py" or "uvicorn app.main:app"
+    from config import settings  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from app.config import settings  # type: ignore
 from adampy.services.ollama_client import OllamaClient
 from adampy.pipeline.semantic_rag import (
     generate_query_variants,

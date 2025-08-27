@@ -3,7 +3,10 @@ import math
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional
 
-from config import settings
+try:  # Allow importing when package is named app
+    from config import settings  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from app.config import settings  # type: ignore
 from adampy.services.ollama_client import OllamaClient
 
 

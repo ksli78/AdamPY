@@ -3,7 +3,10 @@ from typing import List, Optional
 
 import requests
 
-from config import settings
+try:  # Support running as package (e.g., app.config) or module
+    from config import settings  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback for packaged apps
+    from app.config import settings  # type: ignore
 
 
 class OllamaClient:

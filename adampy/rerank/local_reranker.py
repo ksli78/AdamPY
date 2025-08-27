@@ -3,7 +3,10 @@ from typing import List
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from config import settings
+try:  # Import settings regardless of package name
+    from config import settings  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from app.config import settings  # type: ignore
 
 
 class LocalCrossEncoderReranker:
