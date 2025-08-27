@@ -256,6 +256,11 @@ def resolve_model(name: Optional[str]) -> str:
 # Initialize embedder early so startup fails fast if model missing
 EMBEDDER = NomicOnnxEmbedder(EMBED_MODEL_DIR)
 
+
+def embed(texts: List[str]) -> List[List[float]]:
+    return EMBEDDER.encode(texts, normalize_embeddings=True)
+
+
 # ---------------- FastAPI app ----------------
 app = FastAPI(title="Local RAG Service")
 
@@ -278,7 +283,7 @@ app.add_middleware(
 )
 
 client = chromadb.PersistentClient(path=CHROMA_DIR)
-collection = client.get_or_create_collection(COLLECTION)
+collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
 retriever = collection
 
 _debug_lock = threading.Lock()
@@ -553,10 +558,6 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     return splitter.split_text(text)
-
-
-def embed(texts: List[str]) -> List[List[float]]:
-    return EMBEDDER.encode(texts, normalize_embeddings=True)
 
 
 HEADER_FOOTER_RE = re.compile(r'^(Page\b|Revision\b)', re.IGNORECASE)
@@ -1632,7 +1633,7 @@ def reset_api():
     except Exception:
         pass
     global collection
-    collection = client.get_or_create_collection(COLLECTION)
+    collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
     return {"ok": True}
 
 @app.get("/ollama_health")
@@ -1657,7 +1658,7 @@ def embed_health():
 @app.get("/list_docs")
 def list_documents():
     try:
-        collection = collection = client.get_or_create_collection(COLLECTION)
+        collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
 
         # Fetch all document entries with metadata
         results = collection.get(include=["metadatas", "documents"], limit=10000)
