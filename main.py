@@ -1241,12 +1241,17 @@ class QueryBody(BaseModel):
     k: int = 4
     history: Optional[List[dict]] = None
     model: Optional[str] = None  # "Adam Large", "Adam Lite", or raw Ollama tag
-    # New optional filters (non-breaking)
+    # Optional filters (non-breaking)
     org: Optional[str] = None
     category: Optional[str] = None
     doc_code: Optional[str] = None
     owner: Optional[str] = None
     rewrite: bool = True
+
+    # NEW: debug/display controls
+    bypass_reranker: bool = False  # if true, skip cross-encoder step
+    display_k: Optional[int] = None  # number of sources to show back to UI (formatting only)
+
 
 
 class QueryResponse(BaseModel):
@@ -1265,8 +1270,32 @@ class QueryResponse(BaseModel):
     phantom_citations_found: bool = False
     phantom_citation_details: List[Any] = []
 
+    # NEW: UI-only formatting fields (do not affect retrieval)
+    display_k: int = 0
+    display_context: List[Dict[str, Any]] = []
 
 def semantic_query(body: QueryBody) -> QueryResponse:
+    """
+    Semantic RAG flow:
+      1) optional rewrite -> query variants
+      2) dense retrieve per variant (K each)
+      3) RRF fuse -> cutoff
+      4) rerank (or bypass if requested)
+      5) build grounded answer + validate/renumber citations
+      6) return telemetry + UI-only display context
+    """
+    from config import settings  # local import to avoid circulars
+    from adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        dense_retrieve,
+        rrf_fuse,
+        load_reranker_or_reuse,
+        rerank,
+        build_grounded_answer,
+    )
+    from adampy.pipeline.citations import validate_and_fix_citations
+
+    # 1) Query variants (only if rewrite=True)
     ollama = OllamaClient()
     variants = (
         generate_query_variants(
@@ -1286,6 +1315,7 @@ def semantic_query(body: QueryBody) -> QueryResponse:
     if settings.SEMRAG_USE_HYDE and variants.get("hyde"):
         query_set.append(variants["hyde"])
 
+    # 2) Dense retrieval per variant
     retrieved_runs = []
     per_query_results = []
     for q in query_set:
@@ -1311,6 +1341,7 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         )
         per_query_results.append(hits)
 
+    # 3) RRF fuse
     fused = rrf_fuse(per_query_results, settings.SEMRAG_RRF_CUTOFF)
     fusion_logs = [
         {
@@ -1322,26 +1353,38 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         for i, p in enumerate(fused)
     ]
 
-    reranker = load_reranker_or_reuse()
-    reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
-    rerank_logs = [
-        {
-            "doc_id": p.doc_id,
-            "chunk_id": p.chunk_id,
-            "rerank_score": p.rerank_score,
-            "rerank_rank": i + 1,
-        }
-        for i, p in enumerate(reranked)
-    ]
+    # 4) Rerank (or bypass)
+    rerank_logs: List[Dict[str, Any]] = []
+    if body.bypass_reranker:
+        # Skip cross-encoder, just take top N by fused rank
+        reranked = fused[: settings.SEMRAG_RERANK_KEEP]
+    else:
+        reranker = load_reranker_or_reuse()
+        reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
+        rerank_logs = [
+            {
+                "doc_id": p.doc_id,
+                "chunk_id": p.chunk_id,
+                "rerank_score": p.rerank_score,
+                "rerank_rank": i + 1,
+            }
+            for i, p in enumerate(reranked)
+        ]
 
+    # 5) Build grounded answer + validate/repair citations
     answer_raw, final_context = build_grounded_answer(ollama, body.query, reranked)
     final_text, phantom_found, phantom_details = validate_and_fix_citations(
         answer_raw, reranked
     )
 
+    # 6) UI display cap (formatting only)
+    from config import settings as cfg
+    display_k = body.display_k if (body.display_k is not None) else cfg.DISPLAY_TOP_K_DEFAULT
+    display_context = final_context[: max(0, int(display_k))]
+
     return QueryResponse(
         answer=final_text,
-        sources=final_context,
+        sources=final_context,  # keep full set for clients that still read this
         original_query=body.query,
         rewritten_query=variants.get("rewritten") or body.query,
         prompt_rewritten=bool(variants.get("rewritten")) and body.rewrite,
@@ -1353,7 +1396,10 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         final_context=final_context,
         phantom_citations_found=phantom_found,
         phantom_citation_details=phantom_details,
+        display_k=display_k,
+        display_context=display_context,
     )
+
 
 
 # Quick smoke tests:
