@@ -1,3 +1,9 @@
+try:
+    from config import settings
+except ModuleNotFoundError:
+    # fallback if app is installed as a package 'app'
+    from app.config import settings
+
 import sys
 import pysqlite3
 
