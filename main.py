@@ -270,8 +270,30 @@ def resolve_model(name: Optional[str]) -> str:
 EMBEDDER = NomicOnnxEmbedder(EMBED_MODEL_DIR)
 
 
+class _ChromaEmbedder:
+    """Wrapper exposing a name() method for Chroma collections."""
+
+    def __init__(self, embedder: NomicOnnxEmbedder):
+        self._embedder = embedder
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        return self.embed_documents(texts)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._embedder.encode(texts, normalize_embeddings=True)
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embedder.encode([text], normalize_embeddings=True)[0]
+
+    def name(self) -> str:  # pragma: no cover - trivial
+        return "nomic-onnx"
+
+
+CHROMA_EMBED = _ChromaEmbedder(EMBEDDER)
+
+
 def embed(texts: List[str]) -> List[List[float]]:
-    return EMBEDDER.encode(texts, normalize_embeddings=True)
+    return CHROMA_EMBED.embed_documents(texts)
 
 
 # ---------------- FastAPI app ----------------
@@ -296,7 +318,7 @@ app.add_middleware(
 )
 
 client = chromadb.PersistentClient(path=CHROMA_DIR)
-collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
+collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
 retriever = collection
 
 _debug_lock = threading.Lock()
@@ -1646,7 +1668,7 @@ def reset_api():
     except Exception:
         pass
     global collection
-    collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
+    collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
     return {"ok": True}
 
 @app.get("/ollama_health")
@@ -1671,7 +1693,7 @@ def embed_health():
 @app.get("/list_docs")
 def list_documents():
     try:
-        collection = client.get_or_create_collection(COLLECTION, embedding_function=embed)
+        collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
 
         # Fetch all document entries with metadata
         results = collection.get(include=["metadatas", "documents"], limit=10000)
