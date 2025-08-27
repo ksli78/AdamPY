@@ -25,7 +25,37 @@ from collections import deque
 from pathlib import Path as _Path
 from typing import List, Optional, Dict, Any, Tuple, Set
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - fallback to urllib
+    from urllib import request as urlrequest
+
+    class _Response:
+        def __init__(self, resp):
+            self.status_code = resp.status
+            self.headers = resp.headers
+            self._body = resp.read()
+
+        @property
+        def text(self):
+            return self._body.decode("utf-8")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class requests:  # type: ignore
+        @staticmethod
+        def post(url, json=None, timeout=None):
+            data = json.dumps(json).encode("utf-8") if json is not None else None
+            req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"})
+            resp = urlrequest.urlopen(req, timeout=timeout)
+            return _Response(resp)
+
+        @staticmethod
+        def get(url, timeout=None):
+            req = urlrequest.Request(url)
+            resp = urlrequest.urlopen(req, timeout=timeout)
+            return _Response(resp)
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -33,6 +63,35 @@ from pydantic import BaseModel
 
 # ---------------- Vector DB ----------------
 import chromadb
+
+# ---------------- Semantic RAG pipeline ----------------
+try:  # Allow running as "python main.py" or "uvicorn app.main:app"
+    from config import settings  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from app.config import settings  # type: ignore
+
+try:  # Prefer local package name but support being nested under ``app``
+    from adampy.services.ollama_client import OllamaClient
+    from adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        dense_retrieve,
+        rrf_fuse,
+        load_reranker_or_reuse,
+        rerank,
+        build_grounded_answer,
+    )
+    from adampy.pipeline.citations import validate_and_fix_citations
+except ModuleNotFoundError:  # pragma: no cover
+    from app.adampy.services.ollama_client import OllamaClient
+    from app.adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        dense_retrieve,
+        rrf_fuse,
+        load_reranker_or_reuse,
+        rerank,
+        build_grounded_answer,
+    )
+    from app.adampy.pipeline.citations import validate_and_fix_citations
 
 # ---------------- File watching ----------------
 from watchdog.observers import Observer
@@ -84,12 +143,25 @@ class NomicOnnxEmbedder:
         providers = ort.get_available_providers()
         self.session = ort.InferenceSession(onnx_path, providers=providers)
 
-        # Model I/O signatures
-        self.input_names = [i.name for i in self.session.get_inputs()]
-        outs = [o.name for o in self.session.get_outputs()]
-        if not outs:
+        # Model I/O signatures – guard against accidentally using the methods
+        # themselves instead of their return values (which previously triggered
+        # ``AttributeError: 'function' object has no attribute 'name'`` when
+        # running in some environments).
+        get_inputs = getattr(self.session, "get_inputs", None)
+        get_outputs = getattr(self.session, "get_outputs", None)
+        inputs = get_inputs() if callable(get_inputs) else []
+        outputs = get_outputs() if callable(get_outputs) else []
+
+        self.input_names = [i.name for i in inputs if hasattr(i, "name")]
+        out_names = [o.name for o in outputs if hasattr(o, "name")]
+
+        if not self.input_names:
+            raise RuntimeError("Could not resolve ONNX input names.")
+        if not out_names:
             raise RuntimeError("Could not resolve ONNX output name.")
-        self.output_name = outs[0]  # often 'last_hidden_state'
+
+        # often 'last_hidden_state'
+        self.output_name = out_names[0]
 
     def _prepare_arrays(self, texts):
         max_len = self.max_len
@@ -197,6 +269,36 @@ def resolve_model(name: Optional[str]) -> str:
 # Initialize embedder early so startup fails fast if model missing
 EMBEDDER = NomicOnnxEmbedder(EMBED_MODEL_DIR)
 
+
+class _ChromaEmbedder:
+    """Wrapper exposing a name() method for Chroma collections."""
+
+    def __init__(self, embedder: NomicOnnxEmbedder):
+        self._embedder = embedder
+
+    # Chroma 0.5+ expects the __call__ signature to use the parameter name
+    # "input". Older versions accepted "texts", so keep the body identical
+    # but rename the argument to satisfy the validator.
+    def __call__(self, input: List[str]) -> List[List[float]]:  # type: ignore[override]
+        return self.embed_documents(input)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._embedder.encode(texts, normalize_embeddings=True)
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embedder.encode([text], normalize_embeddings=True)[0]
+
+    def name(self) -> str:  # pragma: no cover - trivial
+        return "nomic-onnx"
+
+
+CHROMA_EMBED = _ChromaEmbedder(EMBEDDER)
+
+
+def embed(texts: List[str]) -> List[List[float]]:
+    return CHROMA_EMBED.embed_documents(texts)
+
+
 # ---------------- FastAPI app ----------------
 app = FastAPI(title="Local RAG Service")
 
@@ -219,7 +321,22 @@ app.add_middleware(
 )
 
 client = chromadb.PersistentClient(path=CHROMA_DIR)
-collection = client.get_or_create_collection(COLLECTION)
+
+
+def _ensure_collection():
+    """Return a Chroma collection using our embedder, recreating if mismatched."""
+    try:
+        return client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+    except ValueError:
+        # Existing collection has conflicting embedding function; reset it.
+        try:
+            client.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        return client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+
+
+collection = _ensure_collection()
 retriever = collection
 
 _debug_lock = threading.Lock()
@@ -494,10 +611,6 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     return splitter.split_text(text)
-
-
-def embed(texts: List[str]) -> List[List[float]]:
-    return EMBEDDER.encode(texts, normalize_embeddings=True)
 
 
 HEADER_FOOTER_RE = re.compile(r'^(Page\b|Revision\b)', re.IGNORECASE)
@@ -1143,6 +1256,104 @@ class QueryResponse(BaseModel):
     original_query: str
     rewritten_query: str
     prompt_rewritten: bool
+    alt_queries: List[str] = []
+    hyde_prompt: Optional[str] = None
+    retrieval_runs: List[Dict[str, Any]] = []
+    fusion: List[Dict[str, Any]] = []
+    rerank: List[Dict[str, Any]] = []
+    final_context: List[Dict[str, Any]] = []
+    phantom_citations_found: bool = False
+    phantom_citation_details: List[Any] = []
+
+
+def semantic_query(body: QueryBody) -> QueryResponse:
+    ollama = OllamaClient()
+    variants = (
+        generate_query_variants(
+            ollama,
+            body.query,
+            settings.SEMRAG_VARIANTS,
+            settings.SEMRAG_USE_HYDE,
+        )
+        if body.rewrite
+        else {"rewritten": None, "alternates": [], "hyde": None}
+    )
+
+    query_set = [body.query]
+    if variants.get("rewritten"):
+        query_set.append(variants["rewritten"])
+    query_set += variants.get("alternates", [])[: settings.SEMRAG_VARIANTS]
+    if settings.SEMRAG_USE_HYDE and variants.get("hyde"):
+        query_set.append(variants["hyde"])
+
+    retrieved_runs = []
+    per_query_results = []
+    for q in query_set:
+        hits = dense_retrieve(retriever, q, settings.SEMRAG_K_PER_VARIANT)
+        retrieved_runs.append(
+            {
+                "query": q,
+                "k": settings.SEMRAG_K_PER_VARIANT,
+                "results": [
+                    {
+                        "doc_id": p.doc_id,
+                        "chunk_id": p.chunk_id,
+                        "score_dense": p.score_dense,
+                        "rank": i + 1,
+                        "title": p.title,
+                        "url": p.url,
+                        "section_heading": p.section_heading,
+                        "page_num": p.page_num,
+                    }
+                    for i, p in enumerate(hits)
+                ],
+            }
+        )
+        per_query_results.append(hits)
+
+    fused = rrf_fuse(per_query_results, settings.SEMRAG_RRF_CUTOFF)
+    fusion_logs = [
+        {
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "rrf_score": p.rrf_score,
+            "fused_rank": i + 1,
+        }
+        for i, p in enumerate(fused)
+    ]
+
+    reranker = load_reranker_or_reuse()
+    reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
+    rerank_logs = [
+        {
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "rerank_score": p.rerank_score,
+            "rerank_rank": i + 1,
+        }
+        for i, p in enumerate(reranked)
+    ]
+
+    answer_raw, final_context = build_grounded_answer(ollama, body.query, reranked)
+    final_text, phantom_found, phantom_details = validate_and_fix_citations(
+        answer_raw, reranked
+    )
+
+    return QueryResponse(
+        answer=final_text,
+        sources=final_context,
+        original_query=body.query,
+        rewritten_query=variants.get("rewritten") or body.query,
+        prompt_rewritten=bool(variants.get("rewritten")) and body.rewrite,
+        alt_queries=variants.get("alternates", []),
+        hyde_prompt=variants.get("hyde"),
+        retrieval_runs=retrieved_runs,
+        fusion=fusion_logs,
+        rerank=rerank_logs,
+        final_context=final_context,
+        phantom_citations_found=phantom_found,
+        phantom_citation_details=phantom_details,
+    )
 
 
 # Quick smoke tests:
@@ -1155,6 +1366,8 @@ class QueryResponse(BaseModel):
 
 @app.post("/query", response_model=QueryResponse)
 def query_api(body: QueryBody) -> QueryResponse:
+    if settings.SEMRAG_ENABLED:
+        return semantic_query(body)
     start_total = _now_ms()
     code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
     debug = {
@@ -1473,7 +1686,7 @@ def reset_api():
     except Exception:
         pass
     global collection
-    collection = client.get_or_create_collection(COLLECTION)
+    collection = _ensure_collection()
     return {"ok": True}
 
 @app.get("/ollama_health")
@@ -1498,7 +1711,8 @@ def embed_health():
 @app.get("/list_docs")
 def list_documents():
     try:
-        collection = collection = client.get_or_create_collection(COLLECTION)
+        global collection
+        collection = _ensure_collection()
 
         # Fetch all document entries with metadata
         results = collection.get(include=["metadatas", "documents"], limit=10000)
