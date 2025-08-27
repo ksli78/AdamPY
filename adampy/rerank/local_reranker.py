@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -10,7 +10,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 class LocalCrossEncoderReranker:
-    def __init__(self, model_path: str | None = None):
+    def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path or settings.RERANKER_MODEL_PATH
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
