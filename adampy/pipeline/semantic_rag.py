@@ -1,5 +1,4 @@
 import json
-import math
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional
 
@@ -7,7 +6,9 @@ try:  # Allow importing when package is named app
     from config import settings  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from app.config import settings  # type: ignore
-from adampy.services.ollama_client import OllamaClient
+
+# Use relative import so the package works as ``adampy`` or ``app.adampy``
+from ..services.ollama_client import OllamaClient
 
 
 @dataclass
@@ -111,7 +112,7 @@ _reranker = None
 def load_reranker_or_reuse():
     global _reranker
     if _reranker is None:
-        from adampy.rerank.local_reranker import LocalCrossEncoderReranker
+        from ..rerank.local_reranker import LocalCrossEncoderReranker
 
         _reranker = LocalCrossEncoderReranker()
     return _reranker

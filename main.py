@@ -69,16 +69,29 @@ try:  # Allow running as "python main.py" or "uvicorn app.main:app"
     from config import settings  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from app.config import settings  # type: ignore
-from adampy.services.ollama_client import OllamaClient
-from adampy.pipeline.semantic_rag import (
-    generate_query_variants,
-    dense_retrieve,
-    rrf_fuse,
-    load_reranker_or_reuse,
-    rerank,
-    build_grounded_answer,
-)
-from adampy.pipeline.citations import validate_and_fix_citations
+
+try:  # Prefer local package name but support being nested under ``app``
+    from adampy.services.ollama_client import OllamaClient
+    from adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        dense_retrieve,
+        rrf_fuse,
+        load_reranker_or_reuse,
+        rerank,
+        build_grounded_answer,
+    )
+    from adampy.pipeline.citations import validate_and_fix_citations
+except ModuleNotFoundError:  # pragma: no cover
+    from app.adampy.services.ollama_client import OllamaClient
+    from app.adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        dense_retrieve,
+        rrf_fuse,
+        load_reranker_or_reuse,
+        rerank,
+        build_grounded_answer,
+    )
+    from app.adampy.pipeline.citations import validate_and_fix_citations
 
 # ---------------- File watching ----------------
 from watchdog.observers import Observer

@@ -1,10 +1,19 @@
-from adampy.pipeline.semantic_rag import (
-    generate_query_variants,
-    rrf_fuse,
-    rerank,
-    Passage,
-)
-from adampy.pipeline.citations import validate_and_fix_citations
+try:
+    from adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        rrf_fuse,
+        rerank,
+        Passage,
+    )
+    from adampy.pipeline.citations import validate_and_fix_citations
+except ModuleNotFoundError:  # pragma: no cover - package may be under app
+    from app.adampy.pipeline.semantic_rag import (
+        generate_query_variants,
+        rrf_fuse,
+        rerank,
+        Passage,
+    )
+    from app.adampy.pipeline.citations import validate_and_fix_citations
 
 
 class DummyOllama:
