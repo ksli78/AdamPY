@@ -5,6 +5,11 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 # --- end shim ---
 
+try:
+    from config import settings
+except ModuleNotFoundError:
+    # If someone runs the app as a package (e.g., app.main:app), this fallback helps
+    from app.config import settings  # type: ignore
 
 import sys
 import pysqlite3
