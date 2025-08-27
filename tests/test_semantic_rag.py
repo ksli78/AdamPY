@@ -77,6 +77,10 @@ def test_query_response_fields():
         "fusion",
         "rerank",
         "final_context",
+        "display_context",
+        "display_k",
+        "used_collections",
+        "bypass_reranker",
         "phantom_citations_found",
     ]:
         assert key in block

@@ -1238,7 +1238,9 @@ def rewrite_prompt(prompt: str) -> str:
 # ---- API models & endpoints ----
 class QueryBody(BaseModel):
     query: str
-    k: int = 4
+    k: int = settings.DISPLAY_TOP_K_DEFAULT
+    display_k: Optional[int] = None
+    bypass_reranker: bool = False
     history: Optional[List[dict]] = None
     model: Optional[str] = None  # "Adam Large", "Adam Lite", or raw Ollama tag
     # New optional filters (non-breaking)
@@ -1262,12 +1264,19 @@ class QueryResponse(BaseModel):
     fusion: List[Dict[str, Any]] = []
     rerank: List[Dict[str, Any]] = []
     final_context: List[Dict[str, Any]] = []
+    display_context: List[Dict[str, Any]] = []
+    display_k: int = settings.DISPLAY_TOP_K_DEFAULT
+    used_collections: List[str] = []
+    bypass_reranker: bool = False
     phantom_citations_found: bool = False
     phantom_citation_details: List[Any] = []
 
 
 def semantic_query(body: QueryBody) -> QueryResponse:
     ollama = OllamaClient()
+    display_k = (
+        body.display_k if body.display_k is not None else body.k or settings.DISPLAY_TOP_K_DEFAULT
+    )
     variants = (
         generate_query_variants(
             ollama,
@@ -1286,14 +1295,21 @@ def semantic_query(body: QueryBody) -> QueryResponse:
     if settings.SEMRAG_USE_HYDE and variants.get("hyde"):
         query_set.append(variants["hyde"])
 
-    retrieved_runs = []
-    per_query_results = []
+    retrieved_runs: List[Dict[str, Any]] = []
+    per_query_results: List[List[Any]] = []
+
+    primary = client.get_or_create_collection(
+        settings.COLLECTION_PRIMARY, embedding_function=CHROMA_EMBED
+    )
     for q in query_set:
-        hits = dense_retrieve(retriever, q, settings.SEMRAG_K_PER_VARIANT)
+        hits = dense_retrieve(
+            primary, q, settings.SEMRAG_K_PER_VARIANT, settings.COLLECTION_PRIMARY
+        )
         retrieved_runs.append(
             {
                 "query": q,
                 "k": settings.SEMRAG_K_PER_VARIANT,
+                "collection": settings.COLLECTION_PRIMARY,
                 "results": [
                     {
                         "doc_id": p.doc_id,
@@ -1312,36 +1328,89 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         per_query_results.append(hits)
 
     fused = rrf_fuse(per_query_results, settings.SEMRAG_RRF_CUTOFF)
+    used_collections = [settings.COLLECTION_PRIMARY]
+    fallback_used = False
+    fallback_threshold = 10
+    if (
+        settings.USE_COLLECTION_FALLBACK
+        and len(fused) < fallback_threshold
+    ):
+        fallback = client.get_or_create_collection(
+            settings.COLLECTION_FALLBACK, embedding_function=CHROMA_EMBED
+        )
+        for q in query_set:
+            hits_fb = dense_retrieve(
+                fallback, q, settings.SEMRAG_K_PER_VARIANT, settings.COLLECTION_FALLBACK
+            )
+            retrieved_runs.append(
+                {
+                    "query": q,
+                    "k": settings.SEMRAG_K_PER_VARIANT,
+                    "collection": settings.COLLECTION_FALLBACK,
+                    "results": [
+                        {
+                            "doc_id": p.doc_id,
+                            "chunk_id": p.chunk_id,
+                            "score_dense": p.score_dense,
+                            "rank": i + 1,
+                            "title": p.title,
+                            "url": p.url,
+                            "section_heading": p.section_heading,
+                            "page_num": p.page_num,
+                        }
+                        for i, p in enumerate(hits_fb)
+                    ],
+                }
+            )
+            per_query_results.append(hits_fb)
+        fused = rrf_fuse(per_query_results, settings.SEMRAG_RRF_CUTOFF)
+        used_collections.append(settings.COLLECTION_FALLBACK)
+        fallback_used = True
+        print("[semantic_query] Fallback collection used", flush=True)
     fusion_logs = [
         {
             "doc_id": p.doc_id,
             "chunk_id": p.chunk_id,
             "rrf_score": p.rrf_score,
             "fused_rank": i + 1,
+            "collection": p.collection,
         }
         for i, p in enumerate(fused)
     ]
 
-    reranker = load_reranker_or_reuse()
-    reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
-    rerank_logs = [
-        {
-            "doc_id": p.doc_id,
-            "chunk_id": p.chunk_id,
-            "rerank_score": p.rerank_score,
-            "rerank_rank": i + 1,
-        }
-        for i, p in enumerate(reranked)
-    ]
+    if body.bypass_reranker:
+        reranked = fused[: settings.SEMRAG_RERANK_KEEP]
+        rerank_logs: List[Dict[str, Any]] = []
+        print("[semantic_query] Bypassing reranker", flush=True)
+    else:
+        reranker = load_reranker_or_reuse()
+        reranked = rerank(reranker, body.query, fused, settings.SEMRAG_RERANK_KEEP)
+        rerank_logs = [
+            {
+                "doc_id": p.doc_id,
+                "chunk_id": p.chunk_id,
+                "rerank_score": p.rerank_score,
+                "rerank_rank": i + 1,
+                "collection": p.collection,
+            }
+            for i, p in enumerate(reranked)
+        ]
+
+    if fallback_used and any(
+        p.collection == settings.COLLECTION_FALLBACK for p in reranked
+    ):
+        print("[semantic_query] Fallback passages contributed to final results", flush=True)
 
     answer_raw, final_context = build_grounded_answer(ollama, body.query, reranked)
     final_text, phantom_found, phantom_details = validate_and_fix_citations(
         answer_raw, reranked
     )
 
+    display_context = final_context[:display_k]
+
     return QueryResponse(
         answer=final_text,
-        sources=final_context,
+        sources=display_context,
         original_query=body.query,
         rewritten_query=variants.get("rewritten") or body.query,
         prompt_rewritten=bool(variants.get("rewritten")) and body.rewrite,
@@ -1351,6 +1420,10 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         fusion=fusion_logs,
         rerank=rerank_logs,
         final_context=final_context,
+        display_context=display_context,
+        display_k=display_k,
+        used_collections=used_collections,
+        bypass_reranker=body.bypass_reranker,
         phantom_citations_found=phantom_found,
         phantom_citation_details=phantom_details,
     )

@@ -23,6 +23,7 @@ class Passage:
     score_dense: Optional[float] = None
     rrf_score: Optional[float] = None
     rerank_score: Optional[float] = None
+    collection: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -62,7 +63,9 @@ def generate_query_variants(
     return {"rewritten": rewritten, "alternates": alternates, "hyde": hyde}
 
 
-def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
+def dense_retrieve(
+    chroma_collection, query: str, k: int, collection_name: str
+) -> List[Passage]:
     res = chroma_collection.query(
         query_texts=[query],
         n_results=k,
@@ -85,6 +88,7 @@ def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
                 section_heading=meta.get("section_heading") or meta.get("heading", ""),
                 page_num=meta.get("page") or meta.get("page_num"),
                 score_dense=1 - float(dist) if dist is not None else None,
+                collection=collection_name,
             )
         )
     return passages
@@ -150,6 +154,7 @@ def build_grounded_answer(
                 "url": p.url,
                 "span_start": 0,
                 "span_end": len(p.text),
+                "collection": p.collection,
             }
         )
     context = "\n\n".join(context_lines)
