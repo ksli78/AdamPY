@@ -1,7 +1,7 @@
 import json
 from typing import List, Optional
 
-import requests
+from urllib import request as urlrequest
 
 try:  # Support running as package (e.g., app.config) or module
     from config import settings  # type: ignore
@@ -30,12 +30,13 @@ class OllamaClient:
         if stop:
             payload["stop"] = stop
         url = f"{self.host}/api/generate"
+        request_data = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(url, data=request_data, headers={"Content-Type": "application/json"})
         response_text = ""
-        with requests.post(url, json=payload, stream=True) as r:
-            r.raise_for_status()
-            for line in r.iter_lines():
-                if not line:
+        with urlrequest.urlopen(req) as resp:
+            for raw in resp:
+                if not raw:
                     continue
-                data = json.loads(line)
+                data = json.loads(raw.decode("utf-8"))
                 response_text += data.get("response", "")
         return response_text

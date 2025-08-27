@@ -25,7 +25,37 @@ from collections import deque
 from pathlib import Path as _Path
 from typing import List, Optional, Dict, Any, Tuple, Set
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - fallback to urllib
+    from urllib import request as urlrequest
+
+    class _Response:
+        def __init__(self, resp):
+            self.status_code = resp.status
+            self.headers = resp.headers
+            self._body = resp.read()
+
+        @property
+        def text(self):
+            return self._body.decode("utf-8")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class requests:  # type: ignore
+        @staticmethod
+        def post(url, json=None, timeout=None):
+            data = json.dumps(json).encode("utf-8") if json is not None else None
+            req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"})
+            resp = urlrequest.urlopen(req, timeout=timeout)
+            return _Response(resp)
+
+        @staticmethod
+        def get(url, timeout=None):
+            req = urlrequest.Request(url)
+            resp = urlrequest.urlopen(req, timeout=timeout)
+            return _Response(resp)
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
