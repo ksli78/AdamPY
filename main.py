@@ -318,7 +318,22 @@ app.add_middleware(
 )
 
 client = chromadb.PersistentClient(path=CHROMA_DIR)
-collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+
+
+def _ensure_collection():
+    """Return a Chroma collection using our embedder, recreating if mismatched."""
+    try:
+        return client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+    except ValueError:
+        # Existing collection has conflicting embedding function; reset it.
+        try:
+            client.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        return client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+
+
+collection = _ensure_collection()
 retriever = collection
 
 _debug_lock = threading.Lock()
@@ -1668,7 +1683,7 @@ def reset_api():
     except Exception:
         pass
     global collection
-    collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+    collection = _ensure_collection()
     return {"ok": True}
 
 @app.get("/ollama_health")
@@ -1693,7 +1708,8 @@ def embed_health():
 @app.get("/list_docs")
 def list_documents():
     try:
-        collection = client.get_or_create_collection(COLLECTION, embedding_function=CHROMA_EMBED)
+        global collection
+        collection = _ensure_collection()
 
         # Fetch all document entries with metadata
         results = collection.get(include=["metadatas", "documents"], limit=10000)
