@@ -143,14 +143,25 @@ class NomicOnnxEmbedder:
         providers = ort.get_available_providers()
         self.session = ort.InferenceSession(onnx_path, providers=providers)
 
-        # Model I/O signatures
-        inputs = self.session.get_inputs()
-        self.input_names = [i.name for i in inputs]
-        outputs = self.session.get_outputs()
-        out_names = [o.name for o in outputs]
+        # Model I/O signatures – guard against accidentally using the methods
+        # themselves instead of their return values (which previously triggered
+        # ``AttributeError: 'function' object has no attribute 'name'`` when
+        # running in some environments).
+        get_inputs = getattr(self.session, "get_inputs", None)
+        get_outputs = getattr(self.session, "get_outputs", None)
+        inputs = get_inputs() if callable(get_inputs) else []
+        outputs = get_outputs() if callable(get_outputs) else []
+
+        self.input_names = [i.name for i in inputs if hasattr(i, "name")]
+        out_names = [o.name for o in outputs if hasattr(o, "name")]
+
+        if not self.input_names:
+            raise RuntimeError("Could not resolve ONNX input names.")
         if not out_names:
             raise RuntimeError("Could not resolve ONNX output name.")
-        self.output_name = out_names[0]  # often 'last_hidden_state'
+
+        # often 'last_hidden_state'
+        self.output_name = out_names[0]
 
     def _prepare_arrays(self, texts):
         max_len = self.max_len
