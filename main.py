@@ -144,11 +144,13 @@ class NomicOnnxEmbedder:
         self.session = ort.InferenceSession(onnx_path, providers=providers)
 
         # Model I/O signatures
-        self.input_names = [i.name for i in self.session.get_inputs()]
-        outs = [o.name for o in self.session.get_outputs()]
-        if not outs:
+        inputs = self.session.get_inputs()
+        self.input_names = [i.name for i in inputs]
+        outputs = self.session.get_outputs()
+        out_names = [o.name for o in outputs]
+        if not out_names:
             raise RuntimeError("Could not resolve ONNX output name.")
-        self.output_name = outs[0]  # often 'last_hidden_state'
+        self.output_name = out_names[0]  # often 'last_hidden_state'
 
     def _prepare_arrays(self, texts):
         max_len = self.max_len
