@@ -5,11 +5,9 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 # --- end shim ---
 
-try:
-    from config import settings
-except ModuleNotFoundError:
-    # If someone runs the app as a package (e.g., app.main:app), this fallback helps
-    from app.config import settings  # type: ignore
+
+# If someone runs the app as a package (e.g., app.main:app), this fallback helps
+from config import settings  # type: ignore
 
 import sys
 import pysqlite3
@@ -76,12 +74,6 @@ from pydantic import BaseModel
 
 # ---------------- Vector DB ----------------
 import chromadb
-
-# ---------------- Semantic RAG pipeline ----------------
-try:  # Allow running as "python main.py" or "uvicorn app.main:app"
-    from config import settings  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    from app.config import settings  # type: ignore
 
 try:  # Prefer local package name but support being nested under ``app``
     from adampy.services.ollama_client import OllamaClient
