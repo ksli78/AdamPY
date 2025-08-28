@@ -224,6 +224,9 @@ def _get_text_for_hit(hit: dict) -> str:
     Return usable passage text for a retrieved hit.
     Tries multiple common keys (on the hit and in meta/metadata) and falls back.
     """
+
+    logger.debug("Received dict: %s", json.dumps(hit, indent=2))
+
     for k in ("page_content", "content", "text", "body", "snippet", "text_content"):
         v = hit.get(k)
         if isinstance(v, str) and v.strip():
