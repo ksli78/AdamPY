@@ -70,7 +70,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback to urllib
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ---------------- Vector DB ----------------
 import chromadb
