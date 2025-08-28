@@ -926,10 +926,7 @@ def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict
     """Return chunks that are explicitly cited in the answer."""
     if not answer or not chunks:
         return []
-    # Prefer citations explicitly wrapped in <sup>[n]</sup>; fall back to bare [n]
-    used = {int(n) for n in re.findall(r"<sup>\s*\[(\d+)\]\s*</sup>", answer or "", flags=re.IGNORECASE)}
-    if not used:
-        used = {int(n) for n in re.findall(r"\[(\d+)\]", answer or "") if n.isdigit()}
+    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer) if n.isdigit()}
     if not used:
         return []
     ordered = []
@@ -940,17 +937,14 @@ def filter_cited_sources(answer: str, chunks: List[Dict[str, Any]]) -> List[Dict
 
 
 def _extract_numeric_citations(answer: str, max_index: int) -> Tuple[Set[int], bool]:
-    # Prefer citations explicitly wrapped in <sup>[n]</sup>; fall back to any [n]
-    nums = re.findall(r"<sup>\s*\[(\d+)\]\s*</sup>", answer or "", flags=re.IGNORECASE)
-    if not nums:
-        nums = re.findall(r"\[(\d+)\]", answer or "")
+    brackets = re.findall(r"\[([^\]]+)\]", answer or "")
     used: Set[int] = set()
     valid = True
-    for n in nums:
-        if not str(n).isdigit():
+    for b in brackets:
+        if not b.isdigit():
             valid = False
             continue
-        idx = int(n)
+        idx = int(b)
         if idx < 1 or idx > max_index:
             valid = False
         else:
@@ -1443,11 +1437,6 @@ def query_api(body: QueryBody) -> QueryResponse:
             "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
             "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
             "Maintain completeness and sentence capitalization."
-        )
-        # Reinforce section numbering vs. citation syntax for the second pass
-        extra += (
-            " Use <ol>/<ul> with <li> for lists. Use (1), (2) or ordered list numbering for sections; "
-            "never use [n] for numbering — reserve [n] only for citations wrapped in <sup>[n]</sup>."
         )
         snippet_all = " ".join([h.get("text") or "" for h in hits])
         if "12:00" in snippet_all and "11:59" in snippet_all:
