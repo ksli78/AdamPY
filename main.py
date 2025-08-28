@@ -85,12 +85,6 @@ try:  # Prefer local package name but support being nested under ``app``
         rerank,
         build_grounded_answer,
     )
-    # Clarify list formatting vs. citation syntax to avoid ambiguity
-    sys_prompt += (
-        " LISTS & SECTION NUMBERS: Use <ol>/<ul> with <li> for steps and bullets. "
-        "Use parentheses like (1), (2) or ordered list numbering for sections; never use square brackets for numbering. "
-        "Reserve [n] strictly for citations, always wrapped in <sup>[n]</sup>."
-    )
     from adampy.pipeline.citations import validate_and_fix_citations
     from adampy.services.search import search_filtered
 except ModuleNotFoundError:  # pragma: no cover
