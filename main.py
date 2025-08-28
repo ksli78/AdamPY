@@ -1183,7 +1183,7 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         query_set.append(variants["hyde"])
 
     # Resolve collection for this request (default to settings or doc_v2)
-    col_name = (body.collection or settings.COLLECTION or "doc_v2").strip()
+    col_name = (body.collection or settings.COLLECTION or "docs_v2").strip()
     try:
         retr = _ensure_collection(col_name)
     except Exception as e:
@@ -1350,7 +1350,7 @@ def query_api(body: QueryBody) -> QueryResponse:
     debug["retrieval"]["where"] = where
 
     # Resolve collection for this request (default to settings or doc_v2)
-    col_name = (body.collection or settings.COLLECTION or "doc_v2").strip()
+    col_name = (body.collection or settings.COLLECTION or "docs_v2").strip()
     try:
         retr = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
     except Exception as e:
