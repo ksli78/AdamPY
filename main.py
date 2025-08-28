@@ -181,17 +181,23 @@ app.add_middleware(
 client = chromadb.PersistentClient(path=settings.CHROMA_DIR)
 
 
-def _ensure_collection():
-    """Return a Chroma collection using our embedder, recreating if mismatched."""
+def _ensure_collection(name: Optional[str] = None):
+    """Return a Chroma collection using our embedder, recreating if mismatched.
+
+    If the on-disk collection was created with a different embedding dimension,
+    Chroma raises a ValueError. In that case, delete and recreate the specific
+    collection name so callers always get a usable handle.
+    """
+    col_name = (name or settings.COLLECTION).strip()
     try:
-        return client.get_or_create_collection(settings.COLLECTION, embedding_function=CHROMA_EMBED)
+        return client.get_or_create_collection(col_name, embedding_function=CHROMA_EMBED)
     except ValueError:
         # Existing collection has conflicting embedding function; reset it.
         try:
-            client.delete_collection(settings.COLLECTION)
+            client.delete_collection(col_name)
         except Exception:
             pass
-        return client.get_or_create_collection(settings.COLLECTION, embedding_function=CHROMA_EMBED)
+        return client.get_or_create_collection(col_name, embedding_function=CHROMA_EMBED)
 
 
 collection = _ensure_collection()
@@ -1179,7 +1185,7 @@ def semantic_query(body: QueryBody) -> QueryResponse:
     # Resolve collection for this request (default to settings or doc_v2)
     col_name = (body.collection or settings.COLLECTION or "doc_v2").strip()
     try:
-        retr = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
+        retr = _ensure_collection(col_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open collection '{col_name}': {e}")
 
@@ -2016,8 +2022,8 @@ def _prepend_header_for_embedding(text: str, chunk: IngestChunk) -> str:
     return text
 
 def _get_collection_name(chunk: IngestChunk) -> str:
-    # default to docs_v2 (crawler sends this already)
-    return (chunk.collection or "docs_v2").strip()
+    # default to settings.COLLECTION so ingest/query stay aligned
+    return (chunk.collection or settings.COLLECTION).strip()
 
 def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collection_name: str) -> None:
     """
@@ -2056,7 +2062,8 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
     # Get or create the collection
     try:
         if embedding_function is not None:
-            col = _ensure_collection() # client.get_or_create_collection(name=collection_name, embedding_function=embedding_function)
+            # Ensure the specific collection is compatible with our embedder
+            col = _ensure_collection(collection_name)
         else:
             # If no embedding function is configured here, let the collection use the default EF configured at client level
             col = client.get_or_create_collection(name=collection_name)
@@ -2072,19 +2079,25 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upsert chunk {doc_id} into '{collection_name}': {e}")
+class ResetCollectionBody(BaseModel):
+    collection: Optional[str] = None
+
+
 @app.post("/reset_collection")
-def reset_collection():
+def reset_collection(body: ResetCollectionBody | None = None):
     """
-    Delete and recreate the default settings.COLLECTION.
+    Delete and recreate a collection using the current embedding function.
+
+    If no collection name is provided, resets settings.COLLECTION.
     """
-    col_name = settings.COLLECTION
+    col_name = (body.collection if body else None) or settings.COLLECTION
     try:
         client.delete_collection(col_name)
     except Exception:
-        pass 
+        pass
 
-    client.get_or_create_collection(col_name,embedding_function=CHROMA_EMBED)
-    return {"status":"ok","collection": col_name}
+    client.get_or_create_collection(col_name, embedding_function=CHROMA_EMBED)
+    return {"status": "ok", "collection": col_name}
 
 @app.post("/ingest_document")
 def ingest_document(req: IngestRequest):
