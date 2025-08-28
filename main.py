@@ -2084,7 +2084,7 @@ class ResetCollectionBody(BaseModel):
 
 
 @app.post("/reset_collection")
-def reset_collection(body: ResetCollectionBody | None = None):
+def reset_collection(body: Optional[ResetCollectionBody] = None):
     """
     Delete and recreate a collection using the current embedding function.
 
