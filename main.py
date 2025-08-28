@@ -2072,6 +2072,21 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upsert chunk {doc_id} into '{collection_name}': {e}")
+@app.post("/reset_collection")
+def reset_collection(collection:Optional[str] = Body(default=None)):
+    """
+    Delete and recreate the specified Chroma collection. if no collection
+    name is provided, the default from settings.COLLECTION is used.
+    """
+
+    col_name = (collection or settings.COLLECTION).strip()
+    try:
+        client.delete_collection(col_name)
+    except Exception:
+        pass 
+
+    client.get_or_create_collection(col_name,embedding_function=CHROMA_EMBED)
+    return {"status":"ok","collection": col_name}
 
 @app.post("/ingest_document")
 def ingest_document(req: IngestRequest):
