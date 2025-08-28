@@ -90,7 +90,7 @@ else:
         # Embeddings + storage
         EMBED_MODEL_DIR: str = os.getenv("EMBED_MODEL_DIR", "/opt/adam/models/nomic-ai/nomic-embed-text")
         CHROMA_DIR: str = os.getenv("CHROMA_DIR", "/srv/rag/chroma")
-        COLLECTION: str = os.getenv("COLLECTION", "doc_v2")
+        COLLECTION: str ="doc_v2"
 
         # Filesystem
         WATCH_DIR: str = os.getenv("WATCH_DIR", "/srv/rag/watched")

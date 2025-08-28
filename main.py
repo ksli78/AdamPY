@@ -36,6 +36,24 @@ from collections import deque
 from pathlib import Path as _Path
 from typing import List, Optional, Dict, Any, Tuple, Set
 
+
+
+import logging
+from systemd import journal
+
+logger = logging.getLogger('rag')
+logger.setLevel(logging.DEBUG)  # or INFO, WARNING, etc.
+
+journal_handler = journal.JournalHandler()
+journal_handler.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+journal_handler.setFormatter(formatter)
+
+logger.addHandler(journal_handler)
+
+
+
 try:
     import requests
 except ModuleNotFoundError:  # pragma: no cover - fallback to urllib
@@ -1640,8 +1658,8 @@ def list_documents(collection: Optional[str] = Query(None), limit: int = 10000):
         col_name = (collection or settings.COLLECTION).strip()
 
         # Open the specified collection with the app's embedding function
-        # col = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
         col = _ensure_collection()
+
         # Fetch all document entries with metadata
         results = col.get(include=["metadatas", "documents"], limit=limit)
 
@@ -2054,6 +2072,19 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upsert chunk {doc_id} into '{collection_name}': {e}")
+@app.post("/reset_collection")
+def reset_collection():
+    """
+    Delete and recreate the default settings.COLLECTION.
+    """
+    col_name = settings.COLLECTION
+    try:
+        client.delete_collection(col_name)
+    except Exception:
+        pass 
+
+    client.get_or_create_collection(col_name,embedding_function=CHROMA_EMBED)
+    return {"status":"ok","collection": col_name}
 
 @app.post("/ingest_document")
 def ingest_document(req: IngestRequest):
@@ -2064,6 +2095,9 @@ def ingest_document(req: IngestRequest):
 
     Each chunk is upserted into the specified Chroma collection (default: docs_v2).
     """
+
+    logger.debug("Received IngestRequest: %s", json.dumps(req.dict(), indent=2))
+
     # Normalize request into a list of chunks
     if req.chunks and len(req.chunks) > 0:
         chunks = req.chunks
@@ -2086,16 +2120,20 @@ def ingest_document(req: IngestRequest):
     ingested = []
     for ch in chunks:
         # Ensure we have content
+        logger.debug("_ensure_text_from_payload")
         text = _ensure_text_from_payload(ch)
+        logger.debug("_prepend_header_for_embedding")
         text = _prepend_header_for_embedding(text, ch)
-
+        logger.debug("_build_metadata")
         # Prepare metadata and id
         metadata = _build_metadata(ch)
+        logger.debug("_make_doc_id")
         doc_id = _make_doc_id(ch)
+        logger.debug("_get_collection_name(ch)")
         collection_name = _get_collection_name(ch)
-
+        logger.debug("collection_name:" + collection_name)
         # Upsert into Chroma
-      
+        logger.debug("_upsert_into_chroma(doc_id, text, metadata, collection_name)")
         _upsert_into_chroma(doc_id, text, metadata, collection_name)
 
         ingested.append({
