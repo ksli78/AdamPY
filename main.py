@@ -2256,7 +2256,8 @@ def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
     for k, v in chunk.__dict__.items():
         if k not in md and not k.startswith("_"):
             md[k] = v
-    return md
+    # Ensure metadata conforms to Chroma's primitive-only type requirements
+    return _sanitize_metadata(md)
 
 def _make_doc_id(chunk: IngestChunk) -> str:
     base = chunk.sp_item_id or (chunk.file_name or f"anon-{int(time.time())}")
