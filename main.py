@@ -1309,33 +1309,8 @@ def query_api(body: QueryBody) -> QueryResponse:
         return semantic_query(body)
     start_total = _now_ms()
     code_pat = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+")
-    debug = {
-        "request_id": str(uuid.uuid4()),
-        "timestamp_ms": _now_ms(),
-        "endpoint": "/query",
-        "model": {"generator": resolve_model(body.model), "reranker": "bge-reranker-v2-m3 (transformers, local)" if _BGE_OK else "mistral-7b-instruct"},
-        "query": {
-            "original": body.query,
-            "rewritten": "",
-            "prompt_rewritten": False,
-            "doc_codes_original": code_pat.findall(body.query),
-            "doc_codes_rewritten": [],
-        },
-        "retrieval": {"where": None},
-        "answering": {
-            "first_pass": {"answer": "", "citations": [], "timing_ms": 0},
-            "second_pass_invoked": False,
-            "second_pass": {"answer": "", "citations": [], "timing_ms": 0},
-            "final": {
-                "answer_used": "",
-                "filtered_sources": [],
-                "fallback_reason": "none",
-        "answer_is_html": False,
-        "html_tag_summary": [],
-    },
-},
-"total_time_ms": 0,
-}
+    logger.debug("In query")
+
 
     if body.rewrite:
         rewritten_query_raw = rewrite_prompt(body.query).strip()
@@ -1351,9 +1326,7 @@ def query_api(body: QueryBody) -> QueryResponse:
     else:
         rewritten_query = body.query
         prompt_rewritten = False
-    debug["query"]["rewritten"] = rewritten_query
-    debug["query"]["prompt_rewritten"] = prompt_rewritten
-    debug["query"]["doc_codes_rewritten"] = code_pat.findall(rewritten_query)
+   
 
     where: Optional[Dict[str, Any]] = None
     if body.org or body.category or body.doc_code or body.owner:
@@ -1366,7 +1339,7 @@ def query_api(body: QueryBody) -> QueryResponse:
             where["doc_code"] = body.doc_code
         if body.owner:
             where["owner"] = body.owner
-    debug["retrieval"]["where"] = where
+   
 
     # Resolve collection for this request (default to settings or doc_v2)
     col_name = (body.collection or settings.COLLECTION or "docs_v2").strip()
@@ -1377,20 +1350,12 @@ def query_api(body: QueryBody) -> QueryResponse:
 
     rdebug: Dict[str, Any] = {}
     top_hits = hybrid_rerank(rewritten_query, retr, "bge-reranker-v2-m3", where=where, debug=rdebug)
-    debug["retrieval"].update(rdebug)
+    logger.debug("In Query top_hits: %s",  json.dumps(top_hits, indent=2))
+
     if not top_hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
         final_answer, is_html_final, tags_final = _ensure_html(final_answer)
-        debug["answering"]["final"].update({
-            "answer_used": _truncate(final_answer, 1200),
-            "filtered_sources": [],
-            "fallback_reason": "no_hits_after_rerank",
-            "answer_is_html": is_html_final,
-            "html_tag_summary": tags_final,
-        })
-        debug["total_time_ms"] = _now_ms() - start_total
-        with _debug_lock:
-            _debug_buffer.append(debug)
+      
         return QueryResponse(
             answer=final_answer,
             sources=[],
@@ -1412,22 +1377,13 @@ def query_api(body: QueryBody) -> QueryResponse:
                 hits.append(h)
             if len(hits) >= 3:
                 break
-
+    logger.debug("In Query hits: %s",  json.dumps(hits, indent=2))
     if not hits:
         final_answer = (
             "<p>I couldn't load readable text from the retrieved sources. "
             "Please re-index the policy with a small text preview.</p>"
         )
-        debug["answering"]["final"].update({
-            "answer_used": _truncate(final_answer, 1200),
-            "filtered_sources": [],
-            "fallback_reason": "no_readable_text",
-            "answer_is_html": True,
-            "html_tag_summary": ["p"],
-        })
-        debug["total_time_ms"] = _now_ms() - start_total
-        with _debug_lock:
-            _debug_buffer.append(debug)
+      
         return QueryResponse(
             answer=final_answer,
             sources=[],
@@ -1437,18 +1393,11 @@ def query_api(body: QueryBody) -> QueryResponse:
         )
 
     for i, h in enumerate(hits):
-        raw = h.get("text") or ""
+        logger.debug("hit: %s", json.dumps(h, indent=2))
+        raw = h.get("text_content") or ""
         h["text"] = _extract_passage(raw, rewritten_query)
         h["index"] = i + 1
 
-    debug.setdefault("retrieval", {}).setdefault("context_block_summaries", [
-        {
-            "index": i + 1,
-            "chars": len(h.get("text") or ""),
-            "preview": (h.get("text") or "")[:120] + ("\u2026" if len(h.get("text") or "") > 120 else ""),
-        }
-        for i, h in enumerate(hits)
-    ])
 
     start_ans = _now_ms()
     answer_first = ask_with_context(rewritten_query, hits, chat_history=body.history, model=body.model)
@@ -1456,23 +1405,13 @@ def query_api(body: QueryBody) -> QueryResponse:
     answer_first, is_html_first, tags_first = _ensure_html(answer_first)
     used_first, valid_first = _extract_numeric_citations(answer_first, len(hits))
     citations_first = sorted(list(used_first))
-    debug["answering"]["first_pass"] = {
-        "answer": _truncate(answer_first, 1200),
-        "citations": citations_first,
-        "timing_ms": ans_time,
-    }
+   
     filtered = filter_cited_sources(answer_first, hits) if valid_first and used_first else []
     answer_used = answer_first
     is_html_final = is_html_first
     tags_final = tags_first
     if not valid_first or not filtered:
-        debug["answering"]["second_pass_invoked"] = True
-        extra = (
-            "Your previous answer used invalid citations (e.g., [4.1] or out-of-range). "
-            "Rewrite the answer using only numeric citations [1..N] corresponding to the provided context blocks. "
-            "Rewrite the answer as HTML per the output rules above, and fix citations to numeric [1..N]. "
-            "Maintain completeness and sentence capitalization."
-        )
+       
         snippet_all = " ".join([h.get("text") or "" for h in hits])
         if "12:00" in snippet_all and "11:59" in snippet_all:
             extra += " Include both the start and end time and the total hours if mentioned."
@@ -1489,11 +1428,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         second, is_html_second, tags_second = _ensure_html(second)
         used_second, valid_second = _extract_numeric_citations(second, len(hits))
         citations_second = sorted(list(used_second))
-        debug["answering"]["second_pass"] = {
-            "answer": _truncate(second, 1200),
-            "citations": citations_second,
-            "timing_ms": second_ms,
-        }
+       
         if valid_second and citations_second:
             filtered = filter_cited_sources(second, hits)
             if filtered:
@@ -1503,16 +1438,7 @@ def query_api(body: QueryBody) -> QueryResponse:
         if not filtered:
             final_answer = "I'm sorry, I can't answer confidently from the provided sources."
             final_answer, is_html_final, tags_final = _ensure_html(final_answer)
-            debug["answering"]["final"].update({
-                "answer_used": _truncate(final_answer, 1200),
-                "filtered_sources": [],
-                "fallback_reason": "no_citations_after_second_pass",
-                "answer_is_html": is_html_final,
-                "html_tag_summary": tags_final,
-            })
-            debug["total_time_ms"] = _now_ms() - start_total
-            with _debug_lock:
-                _debug_buffer.append(debug)
+          
             return QueryResponse(
                 answer=final_answer,
                 sources=[],
@@ -1520,8 +1446,7 @@ def query_api(body: QueryBody) -> QueryResponse:
                 rewritten_query=rewritten_query,
                 prompt_rewritten=prompt_rewritten,
             )
-    else:
-        debug["answering"]["second_pass"] = {"answer": "", "citations": [], "timing_ms": 0}
+    else: logger.debug("Some thing bad happened")
 
     rich = []
     for h in filtered:
@@ -1540,26 +1465,7 @@ def query_api(body: QueryBody) -> QueryResponse:
             "snippet": _get_text_for_hit(h)[:280],
         })
 
-    debug["answering"]["final"].update({
-        "answer_used": _truncate(answer_used, 1200),
-        "filtered_sources": [
-            {
-                "index": s["index"],
-                "doc_code": s["doc_code"],
-                "title": s["title"],
-                "sp_web_url": s["sp_web_url"],
-                "score": s["score"],
-                "snippet": _truncate(s["snippet"], 280),
-            }
-            for s in rich
-        ],
-        "answer_is_html": is_html_final,
-        "html_tag_summary": tags_final,
-    })
-    debug["total_time_ms"] = _now_ms() - start_total
-    with _debug_lock:
-        _debug_buffer.append(debug)
-
+  
     return QueryResponse(
         answer=answer_used,
         sources=rich,
