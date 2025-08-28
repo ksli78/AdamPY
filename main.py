@@ -1193,7 +1193,23 @@ def semantic_query(body: QueryBody) -> QueryResponse:
     retrieved_runs = []
     per_query_results = []
     for q in query_set:
-        hits = dense_retrieve(retr, q, settings.SEMRAG_K_PER_VARIANT)
+        try:
+            hits = dense_retrieve(retr, q, settings.SEMRAG_K_PER_VARIANT)
+        except Exception as e:
+            msg = str(e)
+            if "dimension" in msg.lower() or "expecting embedding" in msg.lower():
+                # Reset the collection so future ingests/queries are consistent
+                try:
+                    client.delete_collection(col_name)
+                except Exception:
+                    pass
+                _ = _ensure_collection(col_name)
+                # Surface a clear message so the caller can trigger reingestion
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Collection '{col_name}' had mismatched embedding dimension and was reset. Please re-ingest documents.",
+                )
+            raise
         retrieved_runs.append(
             {
                 "query": q,
@@ -2046,27 +2062,9 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Chroma client unavailable: {e}")
 
-    # Try to reuse your existing embedding function if defined globally
-    embedding_function = None
+    # Always ensure the collection uses our current embedding function
     try:
-        _EF = globals().get("embedding_function")
-        if _EF is None:
-            retr = globals().get("retriever")
-            if retr is not None:
-                _EF = getattr(retr, "embedding_function", None) or getattr(retr, "embedding_fn", None)
-        if _EF is not None:
-            embedding_function = _EF
-    except Exception:
-        pass
-
-    # Get or create the collection
-    try:
-        if embedding_function is not None:
-            # Ensure the specific collection is compatible with our embedder
-            col = _ensure_collection(collection_name)
-        else:
-            # If no embedding function is configured here, let the collection use the default EF configured at client level
-            col = client.get_or_create_collection(name=collection_name)
+        col = _ensure_collection(collection_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open Chroma collection '{collection_name}': {e}")
 
@@ -2078,6 +2076,18 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
             metadatas=[metadata],
         )
     except Exception as e:
+        msg = str(e)
+        # Auto-heal a dimension mismatch by resetting the collection, then ask for re-ingest
+        if "dimension" in msg.lower() or "expecting embedding" in msg.lower():
+            try:
+                client.delete_collection(collection_name)
+                _ = _ensure_collection(collection_name)
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=409,
+                detail=f"Collection '{collection_name}' had mismatched embedding dimension. It was reset; please re-ingest.",
+            )
         raise HTTPException(status_code=500, detail=f"Failed to upsert chunk {doc_id} into '{collection_name}': {e}")
 class ResetCollectionBody(BaseModel):
     collection: Optional[str] = None
@@ -2124,7 +2134,7 @@ def ingest_document(req: IngestRequest):
             file_name=req.file_name,
             text_content=req.text_content,
             content_bytes=req.content_bytes,
-            collection=req.collection or "docs_v2",
+            collection=req.collection or settings.COLLECTION,
             chunk_index=req.chunk_index or 0,
             breadcrumbs=req.breadcrumbs,
         )
