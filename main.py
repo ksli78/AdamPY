@@ -1092,6 +1092,9 @@ class QueryBody(BaseModel):
     bypass_reranker: bool = False  # if true, skip cross-encoder step
     display_k: Optional[int] = None  # number of sources to show back to UI (formatting only)
 
+    # Collection selection for /query
+    collection: Optional[str] = Field(default="doc_v2", description="Chroma collection name to search")
+
 
 
 class QueryResponse(BaseModel):
@@ -1155,11 +1158,18 @@ def semantic_query(body: QueryBody) -> QueryResponse:
     if settings.SEMRAG_USE_HYDE and variants.get("hyde"):
         query_set.append(variants["hyde"])
 
+    # Resolve collection for this request (default to settings or doc_v2)
+    col_name = (body.collection or settings.COLLECTION or "doc_v2").strip()
+    try:
+        retr = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open collection '{col_name}': {e}")
+
     # 2) Dense retrieval per variant
     retrieved_runs = []
     per_query_results = []
     for q in query_set:
-        hits = dense_retrieve(retriever, q, settings.SEMRAG_K_PER_VARIANT)
+        hits = dense_retrieve(retr, q, settings.SEMRAG_K_PER_VARIANT)
         retrieved_runs.append(
             {
                 "query": q,
@@ -1315,8 +1325,15 @@ def query_api(body: QueryBody) -> QueryResponse:
             where["owner"] = body.owner
     debug["retrieval"]["where"] = where
 
+    # Resolve collection for this request (default to settings or doc_v2)
+    col_name = (body.collection or settings.COLLECTION or "doc_v2").strip()
+    try:
+        retr = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open collection '{col_name}': {e}")
+
     rdebug: Dict[str, Any] = {}
-    top_hits = hybrid_rerank(rewritten_query, retriever, "bge-reranker-v2-m3", where=where, debug=rdebug)
+    top_hits = hybrid_rerank(rewritten_query, retr, "bge-reranker-v2-m3", where=where, debug=rdebug)
     debug["retrieval"].update(rdebug)
     if not top_hits:
         final_answer = "I'm sorry, I couldn't find relevant information."
