@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import onnxruntime as ort
@@ -9,7 +9,7 @@ from tokenizers import Tokenizer
 class NomicOnnxEmbedder:
     """ONNXRuntime wrapper for nomic-ai/nomic-embed-text local model."""
 
-    def __init__(self, model_dir: str, max_len: int | None = None, onnx_filename: str = "model.onnx"):
+    def __init__(self, model_dir: str, max_len: Optional[int] = None, onnx_filename: str = "model.onnx"):
         self.model_dir = model_dir.rstrip("/")
         tok_path = os.path.join(self.model_dir, "tokenizer.json")
         onnx_path = os.path.join(self.model_dir, "onnx", onnx_filename)
