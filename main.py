@@ -1640,7 +1640,7 @@ def list_documents(collection: Optional[str] = Query(None), limit: int = 10000):
         col_name = (collection or settings.COLLECTION).strip()
 
         # Open the specified collection with the app's embedding function
-        col = client.get_or_create_collection(name=col_name, embedding_function=CHROMA_EMBED)
+        col = _ensure_collection()
 
         # Fetch all document entries with metadata
         results = col.get(include=["metadatas", "documents"], limit=limit)
