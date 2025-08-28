@@ -57,6 +57,11 @@ if BaseSettings:
         class Config:
             env_prefix = ""
 
+        # Back-compat shim: some modules still reference OLLAMA_HOST
+        @property
+        def OLLAMA_HOST(self) -> str:  # pragma: no cover - simple alias
+            return self.OLLAMA_URL
+
     settings = Settings()
 else:
     def _get_bool(name: str, default: bool) -> bool:
@@ -115,5 +120,10 @@ else:
                 "llama3:8b": "llama3:8b",
                 "mistral-7b-instruct": "mistral-7b-instruct:latest",
             }
+        
+        # Back-compat shim: property alias for legacy usages
+        @property
+        def OLLAMA_HOST(self) -> str:  # pragma: no cover - simple alias
+            return self.OLLAMA_URL
 
     settings = Settings()
