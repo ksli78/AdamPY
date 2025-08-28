@@ -1111,7 +1111,7 @@ class QueryBody(BaseModel):
     display_k: Optional[int] = None  # number of sources to show back to UI (formatting only)
 
     # Collection selection for /query
-    collection: Optional[str] = Field(default="doc_v2", description="Chroma collection name to search")
+    collection: Optional[str] = Field(default="docs_v2", description="Chroma collection name to search")
 
 
 
