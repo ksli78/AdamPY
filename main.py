@@ -224,13 +224,13 @@ def _get_text_for_hit(hit: dict) -> str:
     Return usable passage text for a retrieved hit.
     Tries multiple common keys (on the hit and in meta/metadata) and falls back.
     """
-    for k in ("page_content", "content", "text", "body", "snippet"):
+    for k in ("page_content", "content", "text", "body", "snippet", "text_content"):
         v = hit.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
 
     meta = hit.get("meta") or hit.get("metadata") or {}
-    for k in ("page_content", "content", "text", "body", "snippet"):
+    for k in ("page_content", "content", "text", "body", "snippet", "text_content"):
         v = meta.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
