@@ -1588,6 +1588,25 @@ def ollama_health():
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Ollama unreachable: {e}")
 
+@app.get("/collections")
+def list_collections():
+    """List all Chroma collection names."""
+    try:
+        cols = []
+        try:
+            cols = client.list_collections()
+        except Exception:
+            cols = []
+        names = []
+        for c in cols:
+            name = getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else None)
+            if name:
+                names.append(name)
+        names = sorted(set(names))
+        return {"count": len(names), "collections": names}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list collections: {e}")
+
 @app.get("/embed_health")
 def embed_health():
     try:
