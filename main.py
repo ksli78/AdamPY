@@ -2339,95 +2339,257 @@ class IngestDocument(BaseModel):
     chunk_overlap: Optional[int] = None
     persist: Optional[bool] = False       # ignored; never persist files locally
 
+class IngestChunk(BaseModel):
+    # SharePoint identity / metadata
+    sp_web_url: Optional[str] = None
+    sp_item_id: Optional[str] = None
+    e_tag: Optional[str] = None
+
+    title: Optional[str] = None
+    org: Optional[str] = None
+    org_code: Optional[str] = None
+    category: Optional[str] = None
+    doc_code: Optional[str] = None
+    owner: Optional[str] = None
+    version: Optional[str] = None
+
+    revision_date: Optional[str] = None
+    latest_review_date: Optional[str] = None
+    document_review_date: Optional[str] = None
+    review_approval_date: Optional[str] = None
+
+    keywords: Optional[str] = None
+    enterprise_keywords: List[str] = []
+    association_ids: List[str] = []
+
+    domain: Optional[str] = None
+    allowed_groups: List[str] = []
+
+    # Content identity
+    file_name: Optional[str] = None
+
+    # Content (Markdown text preferred; content_bytes as fallback)
+    content_bytes: Optional[str] = None  # base64 if present
+    text_content: Optional[str] = None   # markdown/plain text
+    summary: Optional[str] = None
+
+    # Chunking info coming from crawler
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    chunk_index: Optional[int] = None
+    breadcrumbs: Optional[str] = None  # e.g., "Telecommuting Process"
+
+    # Routing / storage hints
+    persist: Optional[bool] = Field(default=True, description="If False, do not persist to disk")
+    collection: Optional[str] = Field(default="docs_v2", description="Chroma collection name")
+
+    # extra fields are allowed and will be carried into metadata
+    class Config:
+        extra = "allow"
+
+class IngestRequest(BaseModel):
+    # Accept either one chunk or many chunks in a single POST
+    chunks: Optional[List[IngestChunk]] = None
+
+    # Back-compat: allow a single object body (the old handler used this)
+    # If provided, we will normalize it into a single chunk ingestion.
+    sp_web_url: Optional[str] = None
+    sp_item_id: Optional[str] = None
+    e_tag: Optional[str] = None
+    title: Optional[str] = None
+    file_name: Optional[str] = None
+    text_content: Optional[str] = None
+    content_bytes: Optional[str] = None
+    collection: Optional[str] = None
+    chunk_index: Optional[int] = None
+    breadcrumbs: Optional[str] = None
 
 # ---------------- New: SharePoint-first ingest (no local persistence) ----------------
-@app.post("/ingest_document")
-def ingest_document_api(body: IngestDocument):
+# ========================= Ingestion Endpoint (REPLACED) =========================
+from fastapi import HTTPException
+import base64
+import time
+
+def _ensure_text_from_payload(chunk: IngestChunk) -> str:
     """
-    Accept SharePoint metadata + content (base64 bytes or pre-extracted text),
-    parse to text in-memory (if needed), chunk, embed, upsert. No file persistence.
+    Prefer markdown/plain text from text_content.
+    If missing, try to decode content_bytes (base64). If still missing, 400.
     """
-    # Use per-request chunk overrides if provided
-    global CHUNK_SIZE, CHUNK_OVERLAP
-    orig_size, orig_overlap = CHUNK_SIZE, CHUNK_OVERLAP
+    if chunk.text_content and chunk.text_content.strip():
+        return chunk.text_content
+    if chunk.content_bytes:
+        try:
+            return base64.b64decode(chunk.content_bytes).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    raise HTTPException(status_code=400, detail="No text_content or decodable content_bytes provided for ingestion.")
+
+def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
+    """
+    Flatten known fields + carry extras into metadata. This preserves SharePoint traceability.
+    """
+    md = {
+        "sp_web_url": chunk.sp_web_url,
+        "sp_item_id": chunk.sp_item_id,
+        "e_tag": chunk.e_tag,
+        "title": chunk.title,
+        "org": chunk.org,
+        "org_code": chunk.org_code,
+        "category": chunk.category,
+        "doc_code": chunk.doc_code,
+        "owner": chunk.owner,
+        "version": chunk.version,
+        "revision_date": chunk.revision_date,
+        "latest_review_date": chunk.latest_review_date,
+        "document_review_date": chunk.document_review_date,
+        "review_approval_date": chunk.review_approval_date,
+        "keywords": chunk.keywords,
+        "enterprise_keywords": chunk.enterprise_keywords,
+        "association_ids": chunk.association_ids,
+        "domain": chunk.domain,
+        "allowed_groups": chunk.allowed_groups,
+        "file_name": chunk.file_name,
+        "summary": chunk.summary,
+        "chunk_size": chunk.chunk_size,
+        "chunk_overlap": chunk.chunk_overlap,
+        "chunk_index": chunk.chunk_index,
+        "breadcrumbs": chunk.breadcrumbs,
+        "ingested_at": int(time.time()),
+    }
+    # Include any extra fields passed by crawler
+    for k, v in chunk.__dict__.items():
+        if k not in md and not k.startswith("_"):
+            md[k] = v
+    return md
+
+def _make_doc_id(chunk: IngestChunk) -> str:
+    base = chunk.sp_item_id or (chunk.file_name or f"anon-{int(time.time())}")
+    idx = chunk.chunk_index if chunk.chunk_index is not None else 0
+    return f"{base}-{idx}"
+
+def _prepend_header_for_embedding(text: str, chunk: IngestChunk) -> str:
+    """
+    Give the retriever strong lexical/semantic anchors: DOC, PATH (breadcrumbs), FILE.
+    """
+    header = []
+    if chunk.title:
+        header.append(f"DOC: {chunk.title}")
+    if chunk.breadcrumbs:
+        header.append(f"PATH: {chunk.breadcrumbs}")
+    if chunk.file_name:
+        header.append(f"FILE: {chunk.file_name}")
+    if header:
+        return "\n".join(header) + "\n\n" + text
+    return text
+
+def _get_collection_name(chunk: IngestChunk) -> str:
+    # default to docs_v2 (crawler sends this already)
+    return (chunk.collection or "docs_v2").strip()
+
+def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collection_name: str) -> None:
+    """
+    Insert/update a single chunk in Chroma. We reuse the existing embedding path if your app defines one;
+    otherwise we give a clear error with instructions.
+    """
+    # Try to reuse an existing Chroma client / embedding function from your app
     try:
-        if body.chunk_size: CHUNK_SIZE = int(body.chunk_size)
-        if body.chunk_overlap: CHUNK_OVERLAP = int(body.chunk_overlap)
+        # If you already created a global 'chroma_client' or 'retriever' elsewhere, reuse it.
+        from adampy.pipeline.semantic_rag import get_chroma_client  # OPTIONAL helper you may already have
+        client = get_chroma_client()
+    except Exception:
+        client = None
 
-        # Build stable versioned doc_id
-        version_key = body.version_label or body.etag or "v1"
-        spid = str(body.sp_item_id or body.sp_file_id or body.sp_web_url)
-        doc_id = f"{spid}:{version_key}"
+    if client is None:
+        # Fallback: construct a local client using your existing retrieval client's storage
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma"))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Chroma client unavailable: {e}")
 
-        # Base metadata attached to every chunk
-        base_meta = {
-            "source": "sharepoint",
-            "sp_site_id": body.sp_site_id,
-            "sp_list_id": body.sp_list_id,
-            "sp_item_id": body.sp_item_id,
-            "sp_drive_id": body.sp_drive_id,
-            "sp_file_id": body.sp_file_id,
-            "sp_web_url": body.sp_web_url,
-            "etag": body.etag,
-            "version_label": body.version_label,
-            "summary" : "",
-            "title": body.title,
-            "doc_code": body.doc_code,
-            "org_code": body.org_code,
-            "org": body.org,
-            "category": body.category,
-            "owner": body.owner,
-            "version": body.version,
-            "revision_date": body.revision_date,
-            "latest_review_date": body.latest_review_date,
-            "document_review_date": body.document_review_date,
-            "review_approval_date": body.review_approval_date,
-            "keywords": body.keywords or [],
-            "enterprise_keywords": body.enterprise_keywords or [],
-            "association_ids": body.association_ids or [],
-            "domain": body.domain or "HR",
-            "allowed_groups": body.allowed_groups or ["AllEmployees"],
-        }
+    # Try to reuse your existing embedding function if defined globally
+    embedding_function = None
+    try:
+        # Example: maybe your app exposes a global `embedding_function` or retriever.embedding_fn
+        global embedding_function as _EF  # noqa: F821  (will fail harmlessly if not present)
+        embedding_function = _EF
+    except Exception:
+        pass
 
-        # 1) If text provided, use directly (fastest)
-        if body.text_content and str(body.text_content).strip():
-            text = clean_document_text(body.text_content)
-            if len(text) < 500:
-                raise HTTPException(status_code=400, detail="document under 500 characters after cleanup")
-            summary, category, keywords  = summarize_document(text)
-            meta = dict(base_meta)
-            meta.update({"summary": summary, "category": category, "keywords": keywords})
-            n = upsert_text(doc_id, text, meta)
-            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "text_content", "summary":summary}
+    # Get or create the collection
+    try:
+        if embedding_function is not None:
+            col = client.get_or_create_collection(name=collection_name, embedding_function=embedding_function)
+        else:
+            # If no embedding function is configured here, let the collection use the default EF configured at client level
+            col = client.get_or_create_collection(name=collection_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open Chroma collection '{collection_name}': {e}")
 
-        # 2) Else parse from base64 content bytes ephemerally
-        if body.content_bytes:
-            raw = base64.b64decode(body.content_bytes)
-            suffix = _Path(body.file_name).suffix if body.file_name else ""
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-                tmp = _Path(tf.name)
-                tf.write(raw)
-            try:
-                text = read_text(tmp)
-            finally:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except TypeError:
-                    if tmp.exists():
-                        tmp.unlink()
-            text = clean_document_text(text)
-            if len(text) < 500:
-                raise HTTPException(status_code=400, detail="document under 500 characters after cleanup")
-            summary, category, keywords = summarize_document(text)
-            meta = dict(base_meta)
-            meta.update({"summary": summary, "category": category, "keywords": keywords})
-            n = upsert_text(doc_id, text, meta)
-            return {"ok": True, "doc_id": doc_id, "chunks": n, "used": "content_bytes"}
+    # Upsert
+    try:
+        col.upsert(
+            ids=[doc_id],
+            documents=[text],
+            metadatas=[metadata],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upsert chunk {doc_id} into '{collection_name}': {e}")
 
-        raise HTTPException(status_code=400, detail="Provide either text_content or content_bytes.")
-    finally:
-        CHUNK_SIZE, CHUNK_OVERLAP = orig_size, orig_overlap
+@app.post("/ingest_document")
+def ingest_document(req: IngestRequest):
+    """
+    Accepts either:
+      - {'chunks': [IngestChunk, ...]}  # new crawler (chunked, markdown)
+      - single-object body (backward compatibility)
 
+    Each chunk is upserted into the specified Chroma collection (default: docs_v2).
+    """
+    # Normalize request into a list of chunks
+    if req.chunks and len(req.chunks) > 0:
+        chunks = req.chunks
+    else:
+        # Back-compat: single object body → one chunk
+        single = IngestChunk(
+            sp_web_url=req.sp_web_url,
+            sp_item_id=req.sp_item_id,
+            e_tag=req.e_tag,
+            title=req.title,
+            file_name=req.file_name,
+            text_content=req.text_content,
+            content_bytes=req.content_bytes,
+            collection=req.collection or "docs_v2",
+            chunk_index=req.chunk_index or 0,
+            breadcrumbs=req.breadcrumbs,
+        )
+        chunks = [single]
+
+    ingested = []
+    for ch in chunks:
+        # Ensure we have content
+        text = _ensure_text_from_payload(ch)
+        text = _prepend_header_for_embedding(text, ch)
+
+        # Prepare metadata and id
+        metadata = _build_metadata(ch)
+        doc_id = _make_doc_id(ch)
+        collection_name = _get_collection_name(ch)
+
+        # Upsert into Chroma
+      
+        _upsert_into_chroma(doc_id, text, metadata, collection_name)
+
+        ingested.append({
+            "id": doc_id,
+            "collection": collection_name,
+            "title": ch.title,
+            "file_name": ch.file_name,
+            "chunk_index": ch.chunk_index or 0,
+            "sp_item_id": ch.sp_item_id,
+            "url": ch.sp_web_url,
+        })
+
+    return {"status": "ok", "ingested": ingested, "count": len(ingested)}
 
 # ---------------- New: Delete by SharePoint identity ----------------
 @app.delete("/delete_sp")
