@@ -1411,7 +1411,7 @@ def query_api(body: QueryBody) -> QueryResponse:
     is_html_final = is_html_first
     tags_final = tags_first
     if not valid_first or not filtered:
-       
+        extra = ""
         snippet_all = " ".join([h.get("text") or "" for h in hits])
         if "12:00" in snippet_all and "11:59" in snippet_all:
             extra += " Include both the start and end time and the total hours if mentioned."
@@ -1892,6 +1892,7 @@ def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
     Flatten known fields + carry extras into metadata. This preserves SharePoint traceability.
     """
     md = {
+        "doc_id":chunk.sp_item_id,
         "sp_web_url": chunk.sp_web_url,
         "sp_item_id": chunk.sp_item_id,
         "e_tag": chunk.e_tag,
@@ -1929,7 +1930,7 @@ def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
 def _make_doc_id(chunk: IngestChunk) -> str:
     base = chunk.sp_item_id or (chunk.file_name or f"anon-{int(time.time())}")
     idx = chunk.chunk_index if chunk.chunk_index is not None else 0
-    return f"{base}-{idx}"
+    return f"{base}:{idx}"
 
 def _prepend_header_for_embedding(text: str, chunk: IngestChunk) -> str:
     """
