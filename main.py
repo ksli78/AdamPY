@@ -86,6 +86,7 @@ try:  # Prefer local package name but support being nested under ``app``
         build_grounded_answer,
     )
     from adampy.pipeline.citations import validate_and_fix_citations
+    from adampy.services.search import search_filtered
 except ModuleNotFoundError:  # pragma: no cover
     from app.adampy.services.ollama_client import OllamaClient
     from app.adampy.pipeline.semantic_rag import (
@@ -97,6 +98,7 @@ except ModuleNotFoundError:  # pragma: no cover
         build_grounded_answer,
     )
     from app.adampy.pipeline.citations import validate_and_fix_citations
+    from app.adampy.services.search import search_filtered
 
 # ---------------- File watching ----------------
 from watchdog.observers import Observer
@@ -117,127 +119,7 @@ import traceback
 import difflib
 
 # ---------------- Embeddings: nomic-embed-text via ONNXRuntime ----------------
-import onnxruntime as ort
-from tokenizers import Tokenizer
-import numpy as np
-
-#comment for commit 
-class NomicOnnxEmbedder:
-    """
-    ONNXRuntime wrapper for nomic-ai/nomic-embed-text local model.
-
-    Expected files under EMBED_MODEL_DIR:
-      - tokenizer.json
-      - onnx/model.onnx   (change onnx_filename if you want a different variant)
-    """
-    def __init__(self, model_dir: str, max_len: int = None, onnx_filename: str = "model.onnx"):
-        import os
-        self.model_dir = model_dir.rstrip("/")
-        tok_path = os.path.join(self.model_dir, "tokenizer.json")
-        onnx_path = os.path.join(self.model_dir, "onnx", onnx_filename)
-
-        if not os.path.exists(tok_path):
-            raise RuntimeError(f"Tokenizer not found: {tok_path}")
-        if not os.path.exists(onnx_path):
-            raise RuntimeError(f"ONNX model not found: {onnx_path}")
-
-        self.tokenizer = Tokenizer.from_file(tok_path)
-        self.max_len = max_len or int(os.getenv("EMBED_MAX_LEN", "2048"))
-
-        # CPU by default; switch to onnxruntime-gpu + CUDA providers if desired
-        providers = ort.get_available_providers()
-        self.session = ort.InferenceSession(onnx_path, providers=providers)
-
-        # Model I/O signatures – guard against accidentally using the methods
-        # themselves instead of their return values (which previously triggered
-        # ``AttributeError: 'function' object has no attribute 'name'`` when
-        # running in some environments).
-        get_inputs = getattr(self.session, "get_inputs", None)
-        get_outputs = getattr(self.session, "get_outputs", None)
-        inputs = get_inputs() if callable(get_inputs) else []
-        outputs = get_outputs() if callable(get_outputs) else []
-
-        self.input_names = [i.name for i in inputs if hasattr(i, "name")]
-        out_names = [o.name for o in outputs if hasattr(o, "name")]
-
-        if not self.input_names:
-            raise RuntimeError("Could not resolve ONNX input names.")
-        if not out_names:
-            raise RuntimeError("Could not resolve ONNX output name.")
-
-        # often 'last_hidden_state'
-        self.output_name = out_names[0]
-
-    def _prepare_arrays(self, texts):
-        max_len = self.max_len
-        input_ids, attention_mask = [], []
-        for t in texts:
-            enc = self.tokenizer.encode(t or "")
-            ids = enc.ids[:max_len]
-            att = [1] * len(ids)
-            if len(ids) < max_len:
-                pad = max_len - len(ids)
-                ids += [0] * pad
-                att += [0] * pad
-            input_ids.append(ids)
-            attention_mask.append(att)
-
-        # Optional inputs: many BERT-style models require these
-        token_type_ids = [[0] * max_len for _ in texts]          # all zeros
-        position_ids   = [list(range(max_len)) for _ in texts]   # sometimes expected
-
-        arrays = {
-            "input_ids":      np.asarray(input_ids, dtype=np.int64),
-            "attention_mask": np.asarray(attention_mask, dtype=np.int64),
-            "token_type_ids": np.asarray(token_type_ids, dtype=np.int64),
-            "position_ids":   np.asarray(position_ids, dtype=np.int64),
-        }
-        return arrays
-
-    def _masked_mean_pool(self, token_embs: np.ndarray, attn: np.ndarray) -> np.ndarray:
-        """
-        token_embs: [B, T, H], attn: [B, T]
-        returns: [B, H]
-        """
-        attn = attn[:, :token_embs.shape[1]].astype(np.float32)
-        attn_exp = np.expand_dims(attn, axis=-1)                 # [B, T, 1]
-        summed = (token_embs * attn_exp).sum(axis=1)             # [B, H]
-        counts = np.clip(attn_exp.sum(axis=1), 1e-6, None)       # [B, 1]
-        return summed / counts
-
-    def encode(self, texts, normalize_embeddings: bool = True):
-        if not isinstance(texts, list):
-            texts = [texts]
-
-        arrays = self._prepare_arrays(texts)
-
-        # Feed ONLY what the model actually requires
-        feed = {name: arrays[name] for name in self.input_names if name in arrays}
-        missing = [name for name in self.input_names if name not in feed]
-        if missing:
-            raise RuntimeError(f"Missing inputs not covered by adapter: {missing}")
-
-        out = self.session.run([self.output_name], feed)[0]
-        vecs = np.asarray(out, dtype=np.float32)
-
-        # Pool if the model returned token embeddings
-        if vecs.ndim == 3:                     # [B, T, H]
-            vecs = self._masked_mean_pool(vecs, arrays["attention_mask"])
-        elif vecs.ndim == 4:
-            vecs = vecs.squeeze()
-            if vecs.ndim == 3:
-                vecs = self._masked_mean_pool(vecs, arrays["attention_mask"])
-        elif vecs.ndim == 1:                   # [H] -> [1, H]
-            vecs = vecs[None, :]
-
-        # L2 normalize
-        if normalize_embeddings:
-            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
-            vecs = vecs / norms
-
-        return vecs.tolist()
-
-
+from adampy.services.embedding import NomicOnnxEmbedder, ChromaEmbedder
 
 # ---------------- Configuration ----------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -275,29 +157,7 @@ def resolve_model(name: Optional[str]) -> str:
 EMBEDDER = NomicOnnxEmbedder(EMBED_MODEL_DIR)
 
 
-class _ChromaEmbedder:
-    """Wrapper exposing a name() method for Chroma collections."""
-
-    def __init__(self, embedder: NomicOnnxEmbedder):
-        self._embedder = embedder
-
-    # Chroma 0.5+ expects the __call__ signature to use the parameter name
-    # "input". Older versions accepted "texts", so keep the body identical
-    # but rename the argument to satisfy the validator.
-    def __call__(self, input: List[str]) -> List[List[float]]:  # type: ignore[override]
-        return self.embed_documents(input)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._embedder.encode(texts, normalize_embeddings=True)
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._embedder.encode([text], normalize_embeddings=True)[0]
-
-    def name(self) -> str:  # pragma: no cover - trivial
-        return "nomic-onnx"
-
-
-CHROMA_EMBED = _ChromaEmbedder(EMBEDDER)
+CHROMA_EMBED = ChromaEmbedder(EMBEDDER)
 
 
 def embed(texts: List[str]) -> List[List[float]]:
@@ -1909,70 +1769,6 @@ def download_zip(req: ZipRequest):
     return StreamingResponse(buf, media_type="application/zip", headers=headers)
 
 
-# ---------------- Filtered search ----------------
-def search_filtered(
-    query: str,
-    k: int = 4,
-    path: Optional[str] = None,
-    paths: Optional[List[str]] = None,
-    prefix: Optional[str] = None,
-    source: Optional[str] = None,
-    org: Optional[str] = None,
-    category: Optional[str] = None,
-    doc_code: Optional[str] = None,
-    owner: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    qemb = embed([query])[0]
-    include = ["documents", "metadatas", "distances"]
-
-    def to_hits(res):
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-        return [{"text": d, "meta": m, "score": float(1.0 / (1e-5 + dist))}
-                for d, m, dist in zip(docs, metas, dists)]
-
-    results: List[Dict[str, Any]] = []
-
-    if path:
-        res = collection.query(query_embeddings=[qemb], n_results=max(k, 8),
-                               include=include, where={"path": path})
-        results.extend(to_hits(res))
-    elif paths:
-        for p in paths:
-            res = collection.query(query_embeddings=[qemb], n_results=max(2, k // max(1, len(paths))) + 6,
-                                   include=include, where={"path": p})
-            results.extend(to_hits(res))
-    elif prefix:
-        try:
-            res = collection.query(query_embeddings=[qemb], n_results=max(k, 12),
-                                   include=include, where={"path": {"$contains": prefix}})
-            results.extend(to_hits(res))
-        except Exception:
-            res = collection.query(query_embeddings=[qemb], n_results=max(k * 5, 20), include=include)
-            results.extend([h for h in to_hits(res) if str(h["meta"].get("path", "")).startswith(prefix)])
-    elif source or org or category or doc_code or owner:
-        where: Dict[str, Any] = {}
-        if source:   where["source"] = source
-        if org:      where["org"] = org
-        if category: where["category"] = category
-        if doc_code: where["doc_code"] = doc_code
-        if owner:    where["owner"] = owner
-        res = collection.query(query_embeddings=[qemb], n_results=max(k, 12),
-                               include=include, where=where)
-        results.extend(to_hits(res))
-    else:
-        res = collection.query(query_embeddings=[qemb], n_results=k, include=include)
-        results.extend(to_hits(res))
-
-    seen: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
-    for h in results:
-        key = (h["meta"].get("doc_id") or h["meta"].get("path"), h["meta"].get("chunk"))
-        if key not in seen or h["score"] > seen[key]["score"]:
-            seen[key] = h
-    hits = sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:k]
-    return hits
-
 
 @app.post("/query_path")
 def query_path(body: Dict[str, Any] = Body(...)):
@@ -2044,7 +1840,7 @@ def query_path(body: Dict[str, Any] = Body(...)):
     }
 
     start_retrieve = _now_ms()
-    hits0 = search_filtered(query, k=10, path=path, paths=paths, prefix=prefix, source=source,
+    hits0 = search_filtered(collection, embed, query, k=10, path=path, paths=paths, prefix=prefix, source=source,
                             org=org, category=category, doc_code=doc_code, owner=owner)
     retrieve_ms = _now_ms() - start_retrieve
     for i, ch in enumerate(hits0, 1):
@@ -2510,9 +2306,13 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
     # Try to reuse your existing embedding function if defined globally
     embedding_function = None
     try:
-        # Example: maybe your app exposes a global `embedding_function` or retriever.embedding_fn
-        global embedding_function as _EF  # noqa: F821  (will fail harmlessly if not present)
-        embedding_function = _EF
+        _EF = globals().get("embedding_function")
+        if _EF is None:
+            retr = globals().get("retriever")
+            if retr is not None:
+                _EF = getattr(retr, "embedding_function", None) or getattr(retr, "embedding_fn", None)
+        if _EF is not None:
+            embedding_function = _EF
     except Exception:
         pass
 
