@@ -2056,7 +2056,7 @@ def _upsert_into_chroma(doc_id: str, text: str, metadata: Dict[str, Any], collec
     # Get or create the collection
     try:
         if embedding_function is not None:
-            col = client.get_or_create_collection(name=collection_name, embedding_function=embedding_function)
+            col = _ensure_collection() # client.get_or_create_collection(name=collection_name, embedding_function=embedding_function)
         else:
             # If no embedding function is configured here, let the collection use the default EF configured at client level
             col = client.get_or_create_collection(name=collection_name)
@@ -2135,7 +2135,7 @@ def ingest_document(req: IngestRequest):
         # Upsert into Chroma
         logger.debug("_upsert_into_chroma(doc_id, text, metadata, collection_name)")
         _upsert_into_chroma(doc_id, text, metadata, collection_name)
-
+        logger.debug("_upsert_into_chroma completed")
         ingested.append({
             "id": doc_id,
             "collection": collection_name,
