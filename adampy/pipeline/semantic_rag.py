@@ -81,13 +81,14 @@ def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
     dists = res.get("distances", [[]])[0]
     for pid, doc, meta, dist in zip(ids, docs, metas, dists):
         doc_id, _, chunk_id = pid.partition(":")
+        url = meta.get("sp_web_url") or meta.get("url") or meta.get("path", "")
         passages.append(
             Passage(
                 doc_id=meta.get("doc_id", doc_id),
                 chunk_id=meta.get("chunk", chunk_id),
                 text=doc,
                 title=meta.get("title", ""),
-                url=meta.get("url") or meta.get("path", ""),
+                url=url,
                 section_heading=meta.get("section_heading") or meta.get("heading", ""),
                 page_num=meta.get("page") or meta.get("page_num"),
                 score_dense=1 - float(dist) if dist is not None else None,
@@ -120,6 +121,27 @@ def rrf_fuse(lists: List[List[Passage]], k_keep: int = 50) -> List[Passage]:
                 fused[key].rrf_score = 0.0
             fused[key].rrf_score += score
     ranked = sorted(fused.values(), key=lambda x: x.rrf_score or 0.0, reverse=True)
+    # After ranked = sorted(...):
+    try:
+        logger.debug(
+            "rrf_fuse: lists=%d fused_hits=%d keep=%d",
+            len(lists),
+            len(ranked),
+            k_keep,
+        )
+        for i, p in enumerate(ranked[:10]):  # first 10
+            md = {} if p is None else (p.__dict__ if hasattr(p, "__dict__") else {})
+            logger.debug(
+                "rrf[%02d] doc_id=%s chunk_id=%s rrf_score=%.4f title=%s",
+                i,
+                getattr(p, "doc_id", None),
+                getattr(p, "chunk_id", None),
+                getattr(p, "rrf_score", float("nan")),
+                (getattr(p, "title", None) or (md.get("title") if isinstance(md, dict) else None)),
+            )
+    except Exception as e:
+        logger.debug("rrf_fuse: failed to log fused hits: %s", e)
+
     return ranked[:k_keep]
 
 
@@ -144,6 +166,20 @@ def rerank(
 ) -> List[Passage]:
     texts = [p.text for p in passages]
     scores = reranker.score(query, texts)
+    try:
+        logger.debug("rerank: in=%d out=%d", len(passages), min(len(passages), keep))
+        for i, p in enumerate(ranked[:10]):
+            logger.debug(
+                "rerank[%02d] doc_id=%s chunk_id=%s score=%.4f title=%s",
+                i,
+                getattr(p, "doc_id", None),
+                getattr(p, "chunk_id", None),
+                getattr(p, "rerank_score", float("nan")),
+                (p.title if hasattr(p, "title") else (p.meta or {}).get("title"))
+            )
+    except Exception as e:
+        logger.debug("rerank: failed logging: %s", e)
+
     for p, s in zip(passages, scores):
         p.rerank_score = s
     ranked = sorted(passages, key=lambda x: x.rerank_score or 0.0, reverse=True)
@@ -174,7 +210,8 @@ def build_grounded_answer(
     context = "\n\n".join(context_lines)
     # Log the full context for grounding (requested at line ~156)
     try:
-        logger.debug("build_grounded_answer: context=%s", context)
+        titles = [f"[{i+1}] {p.title}" for i, p in enumerate(passages)]
+        logger.debug("build_grounded_answer: titles=%s", "; ".join(titles))
     except Exception:
         pass
 
