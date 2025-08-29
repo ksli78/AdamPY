@@ -288,7 +288,8 @@ def build_grounded_answer(
 
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
-        context_lines.append(f"[{idx}] TITLE: {p.title}\n{p.text}")
+        title_part = p.title if p.title else ""
+        context_lines.append(f"[{idx}] {title_part}\n{p.text}")
         final_context.append(
         {
             "citation_id": idx,
@@ -306,9 +307,14 @@ def build_grounded_answer(
     logger.debug("build_grounded_answer: context=%s", context)
 
     prompt = (
-        "Answer only using the provided context. Cite passages with [1], [2], ... "
-        "If any part of the question is addressed in the context, extract and summarise it directly; "
-        "only say you don't have enough information if the context truly lacks it."
+        "Please answer the question using only the provided context. "
+        "Format your response as clean, readable HTML with paragraphs, lists, tables, or headings if useful. "
+        "When citing, phrase it like: 'According to section <b>{section title}</b> [n]' "
+        "instead of just '[n]'. "
+        "Be detailed and natural in tone—avoid robotic phrases like 'the context specifies.' "
+        "If the information is not in the context, reply in a friendly way, such as: "
+        "'I couldn’t find that information in the available documents. If you believe this should be available, "
+        "please contact the IT Department for assistance.' "
         f"\n\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
     )
 
