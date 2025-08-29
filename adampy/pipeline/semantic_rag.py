@@ -155,16 +155,13 @@ def load_reranker_or_reuse():
     return _reranker
 
 
-def rerank(
-    reranker,
-    query: str,
-    passages: List[Passage],
-    keep: int = 10,
-) -> List[Passage]:
+def rerank(reranker,query: str,passages: List[Passage],keep: int = 10,) -> List[Passage]:
     texts = [p.text for p in passages]
     scores = reranker.score(query, texts)
+
     for p, s in zip(passages, scores):
         p.rerank_score = s
+
     ranked = sorted(passages, key=lambda x: x.rerank_score or 0.0, reverse=True)
 
     try:
@@ -222,11 +219,13 @@ def build_grounded_answer(
         by_doc[p.title or p.doc_id].append((overlap, p))
 
     def group_score(items):
-        # total term overlap across the doc's chunks
-        total_overlap = sum(o for o, _ in items)
-        # best available numeric score to help tie-break (prefers higher rerank/dense)
-        best_rerank = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in items)
-        best_dense  = max((getattr(p, "score_dense", None) or float("-inf")) for _, p in items)
+        # Use item[0] to access the first element of each tuple/list
+        total_overlap = sum(item[0] for item in items)
+    
+        # Use item[1] to access the second element (the passage object)
+        best_rerank = max((getattr(item[1], "rerank_score", None) or float("-inf")) for item in items)
+        best_dense  = max((getattr(item[1], "score_dense", None) or float("-inf")) for item in items)
+    
         return (total_overlap, best_rerank, best_dense)
 
     # pick the single best group
