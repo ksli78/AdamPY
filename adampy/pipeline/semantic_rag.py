@@ -153,6 +153,7 @@ def build_grounded_answer(
             }
         )
     context = "\n\n".join(context_lines)
+    logger.debug(context)
     prompt = (
         "Answer only using the provided context. Cite passages with bracketed numbers [1], [2], ..."
         " matching the context items. If the answer is not supported, say you don't have enough information."
