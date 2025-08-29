@@ -87,6 +87,7 @@ def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
                 score_dense=1 - float(dist) if dist is not None else None,
             )
         )
+        
     return passages
 
 
@@ -153,7 +154,7 @@ def build_grounded_answer(
             }
         )
     context = "\n\n".join(context_lines)
-    logger.debug(context)
+    
     prompt = (
         "Answer only using the provided context. Cite passages with bracketed numbers [1], [2], ..."
         " matching the context items. If the answer is not supported, say you don't have enough information."
