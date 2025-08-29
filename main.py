@@ -1892,7 +1892,6 @@ def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
     Flatten known fields + carry extras into metadata. This preserves SharePoint traceability.
     """
     md = {
-        "doc_id":chunk.sp_item_id,
         "sp_web_url": chunk.sp_web_url,
         "sp_item_id": chunk.sp_item_id,
         "e_tag": chunk.e_tag,
@@ -1917,8 +1916,10 @@ def _build_metadata(chunk: IngestChunk) -> Dict[str, Any]:
         "chunk_size": chunk.chunk_size,
         "chunk_overlap": chunk.chunk_overlap,
         "chunk_index": chunk.chunk_index,
+        "chunk":  chunk.chunk_index, 
         "breadcrumbs": chunk.breadcrumbs,
         "ingested_at": int(time.time()),
+        "text": chunk.text_content
     }
     # Include any extra fields passed by crawler
     for k, v in chunk.__dict__.items():
