@@ -12,7 +12,8 @@ except ModuleNotFoundError:  # pragma: no cover
 from ..services.ollama_client import OllamaClient
 
 
-logger = logging.getLogger(__name__)
+# Use the app-wide logger configured in main.py to write to journald
+logger = logging.getLogger('rag')
 
 
 @dataclass
