@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional
 
@@ -9,6 +10,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
 # Use relative import so the package works as ``adampy`` or ``app.adampy``
 from ..services.ollama_client import OllamaClient
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -87,7 +91,18 @@ def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
                 score_dense=1 - float(dist) if dist is not None else None,
             )
         )
-        
+    # Log passages (placed near original line ~90)
+    try:
+        payload = [p.to_dict() for p in passages]
+        logger.debug(
+            "dense_retrieve: query=%r k=%d passages=%s",
+            query,
+            k,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    except Exception as e:  # pragma: no cover
+        logger.debug("dense_retrieve: failed to log passages: %s", e)
+
     return passages
 
 
@@ -154,7 +169,12 @@ def build_grounded_answer(
             }
         )
     context = "\n\n".join(context_lines)
-    
+    # Log the full context for grounding (requested at line ~156)
+    try:
+        logger.debug("build_grounded_answer: context=%s", context)
+    except Exception:
+        pass
+
     prompt = (
         "Answer only using the provided context. Cite passages with bracketed numbers [1], [2], ..."
         " matching the context items. If the answer is not supported, say you don't have enough information."
