@@ -180,6 +180,46 @@ def rerank(reranker,query: str,passages: List[Passage],keep: int = 10,) -> List[
 
     return ranked[:keep]
 
+
+import re
+from html import escape as _htmlesc
+
+def _force_html(s: str) -> str:
+    # If it already looks like HTML, keep it.
+    if re.search(r'</?(p|ul|ol|li|h[1-6]|table|thead|tbody|tr|td|th|br)\b', s, re.I):
+        return s
+    # Convert plaintext / markdown-ish line breaks to basic HTML paragraphs.
+    parts = [p.strip() for p in re.split(r'\n\s*\n', s.strip()) if p.strip()]
+    if not parts:
+        return "<p></p>"
+    # Turn simple bullets into a list if most lines start with '-' or '*'
+    if all(re.match(r'^\s*[-*]\s+', ln) for ln in s.splitlines() if ln.strip()):
+        items = [re.sub(r'^\s*[-*]\s+', '', ln).strip() for ln in s.splitlines() if ln.strip()]
+        return "<ul>" + "".join(f"<li>{_htmlesc(it)}</li>" for it in items) + "</ul>"
+    return "".join(f"<p>{_htmlesc(p)}</p>" for p in parts)
+
+def _upgrade_citation_sup(s: str) -> str:
+    # Replace bare [number] not already inside tags with <sup>[number]</sup>
+    # Avoid double-wrapping inside existing HTML tags.
+    return re.sub(r'(?<![>#])\[(\d+)\]', r'<sup>[\1]</sup>', s)
+
+def _dehedge_anywhere(s: str) -> str:
+    patterns = [
+        r'\baccording to (the )?provided context\b',
+        r'\bbased on (the )?provided context\b',
+        r'\baccording to (the )?context\b',
+        r'\bas per (the )?context\b',
+        r'\bfrom (the )?context\b',
+    ]
+    for pat in patterns:
+        s = re.sub(pat, '', s, flags=re.I)
+    # Clean up leftover double spaces/grammar after removals
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = re.sub(r'\s+([,.;:])', r'\1', s)
+    return s.strip()
+
+
+
 def build_grounded_answer(
     ollama_client: OllamaClient,
     query: str,
@@ -308,15 +348,18 @@ def build_grounded_answer(
 
     prompt = (
         "Please answer the question using only the provided context. "
-        "Always Format your response as clean, readable HTML with paragraphs, lists, tables, or headings if useful."
-        "When citing, phrase it like: 'According to section <b>{section title}</b> [n]' "
-        "instead of just '[n]'. "
-        "Be detailed and natural in tone—avoid robotic phrases like 'the context specifies.' "
-        "If the information is not in the context, reply in a friendly way, such as: "
+        "Format the entire response as clean HTML. Use paragraphs, lists, headings, and tables when helpful. "
+        "When citing, write it like: 'According to section <b>{section title}</b> [n]' instead of just '[n]'. "
+        "Be detailed and natural—avoid formal or robotic phrases. "
+        "If the information is not in the context, reply in a friendly way, e.g.: "
         "'I couldn’t find that information in the available documents. If you believe this should be available, "
         "please contact the IT Department for assistance.' "
         f"\n\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
     )
 
     answer = ollama_client.generate(prompt)
+    answer = _dehedge_anywhere(answer)
+    answer = _upgrade_citation_sup(answer)
+    answer = _force_html(answer)
+    
     return answer, final_context
