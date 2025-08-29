@@ -180,6 +180,8 @@ def rerank(reranker,query: str,passages: List[Passage],keep: int = 10,) -> List[
 
     return ranked[:keep]
 
+
+
 def build_grounded_answer(
     ollama_client: OllamaClient,
     query: str,
@@ -187,168 +189,125 @@ def build_grounded_answer(
 ) -> tuple[str, List[Dict[str, Any]]]:
     context_lines = []
     logger.debug("in build_grounded_answer")
-
+    
     import re
-    from html import escape as _htmlesc
-    from collections import defaultdict
-
-    # ---------- helpers (local) ----------
+    
     def _strip_header(t: str) -> str:
         # remove the leading DOC/PATH/FILE banner your pipeline prepends
         return re.sub(r'^DOC:.*?\nPATH:.*?\nFILE:.*?\n\n', '', t, flags=re.S)
-
+    
     def _terms(s: str) -> set[str]:
         return {w for w in re.findall(r'\w+', (s or '').lower()) if len(w) > 1}
-
-    def _force_html(s: str) -> str:
-        # If it already looks like HTML, keep it.
-        if re.search(r'</?(p|ul|ol|li|h[1-6]|table|thead|tbody|tr|td|th|br)\b', s, re.I):
-            return s
-        # Convert plaintext/markdown-ish breaks to simple HTML
-        parts = [p.strip() for p in re.split(r'\n\s*\n', s.strip()) if p.strip()]
-        if not parts:
-            return "<p></p>"
-        # Turn simple bullets into <ul> if appropriate
-        lines = [ln for ln in s.splitlines() if ln.strip()]
-        if lines and all(re.match(r'^\s*[-*]\s+', ln) for ln in lines):
-            items = [re.sub(r'^\s*[-*]\s+', '', ln).strip() for ln in lines]
-            return "<ul>" + "".join(f"<li>{_htmlesc(it)}</li>" for it in items) + "</ul>"
-        return "".join(f"<p>{_htmlesc(p)}</p>" for p in parts)
-
-    def _upgrade_citation_sup(s: str) -> str:
-        # Replace bare [number] (not inside tags) with <sup>[number]</sup>
-        return re.sub(r'(?<![>#])\[(\d+)\]', r'<sup>[\1]</sup>', s)
-
-    def _dehedge_anywhere(s: str) -> str:
-        # Remove robotic hedges anywhere (case-insensitive)
-        patterns = [
-            r'\baccording to (the )?provided context\b',
-            r'\bbased on (the )?provided context\b',
-            r'\baccording to (the )?context\b',
-            r'\bas per (the )?context\b',
-            r'\bfrom (the )?context\b',
-            r'\bthe context (does|doesn’t|does not|states|indicates)\b',
-        ]
-        for pat in patterns:
-            s = re.sub(pat, '', s, flags=re.I)
-        # Clean punctuation/spacing after removals
-        s = re.sub(r'\s{2,}', ' ', s)
-        s = re.sub(r'\s+([,.;:])', r'\1', s)
-        return s.strip()
-
-    def _inject_section_titles(s: str, id_to_title: dict[str, str]) -> str:
-        """
-        If model wrote 'According to section [n]' (without a title),
-        replace with 'According to section <b>{title}</b> [n]'.
-        Also, if it wrote a wrong/empty title, prefer our known title.
-        """
-        # Case 1: No title at all
-        def repl_no_title(m):
-            idx = m.group(1)
-            title = id_to_title.get(idx, "").strip()
-            if not title:
-                return f"According to section [\u200b{idx}]"  # zero-width space to avoid re-match loop
-            return f"According to section <b>{_htmlesc(title)}</b> [{idx}]"
-
-        s = re.sub(r'(?i)according to section\s*\[(\d+)\]', repl_no_title, s)
-
-        # Case 2: Has a title but we want to normalize it to our canonical title
-        def repl_has_title(m):
-            idx = m.group(2)
-            want = id_to_title.get(idx, "").strip()
-            if not want:
-                return m.group(0)  # keep original if we don't know the title
-            return f"According to section <b>{_htmlesc(want)}</b> [{idx}]"
-
-        s = re.sub(
-            r'(?i)according to section\s*(?:<b>)?([^<\[]*?)(?:</b>)?\s*\[(\d+)\]',
-            repl_has_title,
-            s,
-        )
-        return s
-
-    # ---------- passage selection & grouping ----------
+    
+    # pick passages with any query-term overlap; if none match, keep originals
     q_terms = _terms(query)
     scored = []
+    # send a smaller, more focused context (tweak N as you like)
     TOP_N = 6
     for p in passages:
         cleaned = _strip_header(p.text or "")
-        p.text = cleaned  # mutate so downstream uses clean text
+        p.text = cleaned  # mutate in place so everything downstream uses the clean text
         overlap = len(q_terms & _terms(cleaned))
         scored.append((overlap, p))
 
     # prefer passages with any query-term overlap; if none, keep originals
     scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
     passages = [p for _, p in scored][:TOP_N]
-
-    # group by doc/title and score groups
+    # --- NEW: collapse to the single best-matching document group ---
     from collections import defaultdict
-    by_doc = defaultdict(list)
-
-    # normalize 'scored'
+    import math
+    # --- Normalize 'scored' to a uniform [(overlap:int, Passage), ...] ---
     norm_scored = []
     for entry in scored:
+        # cases: (overlap, Passage)  OR  Passage  OR anything else (ignore)
         if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Passage):
+            overlap, p = entry
             try:
-                overlap = int(entry[0])
+                overlap = int(overlap)
             except Exception:
                 overlap = 0
-            norm_scored.append((overlap, entry[1]))
+            norm_scored.append((overlap, p))
         elif isinstance(entry, Passage):
             norm_scored.append((0, entry))
-    if not norm_scored:
-        norm_scored = [(0, p) for p in passages]
+        else:
+            # unknown shape – skip
+            continue
 
-    for overlap, p in norm_scored:
+    scored = norm_scored
+    if not scored:
+        # nothing usable; short-circuit to original passages
+        scored = [(0, p) for p in passages]
+
+    # score by (sum of overlaps, then best rerank/dense as tie-breakers)
+    by_doc = defaultdict(list)
+    for overlap, p in scored:
         by_doc[p.title or p.doc_id].append((overlap, p))
 
     def group_score(items):
-        if not items:
+        # Normalize: ensure we are working with a list of (overlap:int, Passage) pairs
+        norm = []
+        for it in items:
+            if isinstance(it, tuple) and len(it) >= 2 and isinstance(it[1], Passage):
+                overlap, p = it[0], it[1]
+            elif isinstance(it, Passage):
+                overlap, p = 0, it
+            else:
+                # Unknown shape; skip
+                continue
+            try:
+                overlap = int(overlap)
+            except Exception:
+                overlap = 0
+            norm.append((overlap, p))
+
+        # If nothing valid, score as zeroes
+        if not norm:
             return (0, float("-inf"), float("-inf"))
-        total_overlap = sum(o for o, _ in items)
-        best_rerank  = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in items)
-        best_dense   = max((getattr(p, "score_dense",  None) or float("-inf")) for _, p in items)
+
+        # Now compute scores safely
+        total_overlap = sum(o for o, _ in norm)
+        best_rerank  = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in norm)
+        best_dense   = max((getattr(p, "score_dense",  None) or float("-inf")) for _, p in norm)
         return (total_overlap, best_rerank, best_dense)
 
+    # pick the single best group
     best_title, best_items = max(by_doc.items(), key=group_score)
 
-    # sort within that doc
+    # Sort within that doc: overlap first, then rerank, then dense
     best_items.sort(
         key=lambda t: (
-            (t[0] > 0),
-            t[0],
+            (t[0] > 0),                      # any overlap
+            t[0],                            # amount of overlap
             getattr(t[1], "rerank_score", 0) or 0.0,
             getattr(t[1], "score_dense", 0) or 0.0,
         ),
         reverse=True,
     )
-
+    
     # reduce context to tight top-k from the chosen doc
     TOP_N_FROM_BEST_DOC = 4
     passages = [p for (_, p) in best_items[:TOP_N_FROM_BEST_DOC]]
 
-    # ---------- build context ----------
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
         title_part = p.title if p.title else ""
         context_lines.append(f"[{idx}] {title_part}\n{p.text}")
         final_context.append(
-            {
-                "citation_id": idx,
-                "doc_id": p.doc_id,
-                "chunk_id": p.chunk_id,
-                "title": p.title,
-                "url": p.url,
-                "span_start": 0,
-                "span_end": len(p.text),
-            }
+        {
+            "citation_id": idx,
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "title": p.title,
+            "url": p.url,
+            "span_start": 0,
+            "span_end": len(p.text),
+        }
         )
-
     context = "\n\n".join(context_lines)
+    # Log the full context for grounding (requested at line ~156)
     logger.debug("build_grounded_answer: titles=%s", "; ".join(f"[{i+1}] {p.title}" for i,p in enumerate(passages)))
     logger.debug("build_grounded_answer: context=%s", context)
 
-    # ---------- prompt ----------
     STYLE_INSTRUCTIONS = (
         "Please answer the question using only the provided context. "
         "Format the entire response as clean HTML. Use paragraphs, lists, headings, and tables when helpful. "
@@ -362,163 +321,5 @@ def build_grounded_answer(
         f"{STYLE_INSTRUCTIONS}\n\n"
         f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
     )
-
-    # ---------- generate & enforce ----------
     answer = ollama_client.generate(prompt)
-
-    # Build id->title map for citation title injection
-    id_to_title = {str(c['citation_id']): (c.get('title') or '').strip() for c in final_context}
-
-    # 1) Ensure citation phrasing includes a title where missing / normalize titles
-    answer = _inject_section_titles(answer, id_to_title)
-    # 2) Remove hedgy "context" phrasing anywhere
-    answer = _dehedge_anywhere(answer)
-    # 3) Better-looking citations
-    answer = _upgrade_citation_sup(answer)
-    # 4) Guarantee HTML
-    answer = _force_html(answer)
-
     return answer, final_context
-
-
-# def build_grounded_answer(
-#     ollama_client: OllamaClient,
-#     query: str,
-#     passages: List[Passage],
-# ) -> tuple[str, List[Dict[str, Any]]]:
-#     context_lines = []
-#     logger.debug("in build_grounded_answer")
-    
-#     import re
-    
-#     def _strip_header(t: str) -> str:
-#         # remove the leading DOC/PATH/FILE banner your pipeline prepends
-#         return re.sub(r'^DOC:.*?\nPATH:.*?\nFILE:.*?\n\n', '', t, flags=re.S)
-    
-#     def _terms(s: str) -> set[str]:
-#         return {w for w in re.findall(r'\w+', (s or '').lower()) if len(w) > 1}
-    
-#     # pick passages with any query-term overlap; if none match, keep originals
-#     q_terms = _terms(query)
-#     scored = []
-#     # send a smaller, more focused context (tweak N as you like)
-#     TOP_N = 6
-#     for p in passages:
-#         cleaned = _strip_header(p.text or "")
-#         p.text = cleaned  # mutate in place so everything downstream uses the clean text
-#         overlap = len(q_terms & _terms(cleaned))
-#         scored.append((overlap, p))
-
-#     # prefer passages with any query-term overlap; if none, keep originals
-#     scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
-#     passages = [p for _, p in scored][:TOP_N]
-#     # --- NEW: collapse to the single best-matching document group ---
-#     from collections import defaultdict
-#     import math
-#     # --- Normalize 'scored' to a uniform [(overlap:int, Passage), ...] ---
-#     norm_scored = []
-#     for entry in scored:
-#         # cases: (overlap, Passage)  OR  Passage  OR anything else (ignore)
-#         if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Passage):
-#             overlap, p = entry
-#             try:
-#                 overlap = int(overlap)
-#             except Exception:
-#                 overlap = 0
-#             norm_scored.append((overlap, p))
-#         elif isinstance(entry, Passage):
-#             norm_scored.append((0, entry))
-#         else:
-#             # unknown shape – skip
-#             continue
-
-#     scored = norm_scored
-#     if not scored:
-#         # nothing usable; short-circuit to original passages
-#         scored = [(0, p) for p in passages]
-
-#     # score by (sum of overlaps, then best rerank/dense as tie-breakers)
-#     by_doc = defaultdict(list)
-#     for overlap, p in scored:
-#         by_doc[p.title or p.doc_id].append((overlap, p))
-
-#     def group_score(items):
-#         # Normalize: ensure we are working with a list of (overlap:int, Passage) pairs
-#         norm = []
-#         for it in items:
-#             if isinstance(it, tuple) and len(it) >= 2 and isinstance(it[1], Passage):
-#                 overlap, p = it[0], it[1]
-#             elif isinstance(it, Passage):
-#                 overlap, p = 0, it
-#             else:
-#                 # Unknown shape; skip
-#                 continue
-#             try:
-#                 overlap = int(overlap)
-#             except Exception:
-#                 overlap = 0
-#             norm.append((overlap, p))
-
-#         # If nothing valid, score as zeroes
-#         if not norm:
-#             return (0, float("-inf"), float("-inf"))
-
-#         # Now compute scores safely
-#         total_overlap = sum(o for o, _ in norm)
-#         best_rerank  = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in norm)
-#         best_dense   = max((getattr(p, "score_dense",  None) or float("-inf")) for _, p in norm)
-#         return (total_overlap, best_rerank, best_dense)
-
-#     # pick the single best group
-#     best_title, best_items = max(by_doc.items(), key=group_score)
-
-#     # Sort within that doc: overlap first, then rerank, then dense
-#     best_items.sort(
-#         key=lambda t: (
-#             (t[0] > 0),                      # any overlap
-#             t[0],                            # amount of overlap
-#             getattr(t[1], "rerank_score", 0) or 0.0,
-#             getattr(t[1], "score_dense", 0) or 0.0,
-#         ),
-#         reverse=True,
-#     )
-    
-#     # reduce context to tight top-k from the chosen doc
-#     TOP_N_FROM_BEST_DOC = 4
-#     passages = [p for (_, p) in best_items[:TOP_N_FROM_BEST_DOC]]
-
-#     final_context: List[Dict[str, Any]] = []
-#     for idx, p in enumerate(passages, start=1):
-#         title_part = p.title if p.title else ""
-#         context_lines.append(f"[{idx}] {title_part}\n{p.text}")
-#         final_context.append(
-#         {
-#             "citation_id": idx,
-#             "doc_id": p.doc_id,
-#             "chunk_id": p.chunk_id,
-#             "title": p.title,
-#             "url": p.url,
-#             "span_start": 0,
-#             "span_end": len(p.text),
-#         }
-#         )
-#     context = "\n\n".join(context_lines)
-#     # Log the full context for grounding (requested at line ~156)
-#     logger.debug("build_grounded_answer: titles=%s", "; ".join(f"[{i+1}] {p.title}" for i,p in enumerate(passages)))
-#     logger.debug("build_grounded_answer: context=%s", context)
-
-#     prompt = (
-#         "Please answer the question using only the provided context. "
-#         "Format the entire response as clean HTML. Use paragraphs, lists, headings, and tables when helpful. "
-#         "When citing, write it like: 'According to section <b>{section title}</b> [n]' instead of just '[n]'. "
-#         "Be detailed and natural—avoid formal or robotic phrases. "
-#         "If the information is not in the context, reply in a friendly way, e.g.: "
-#         "'I couldn’t find that information in the available documents. If you believe this should be available, "
-#         "please contact the IT Department for assistance.' "
-#         f"\n\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
-#     )
-
-#     answer = ollama_client.generate(prompt)
-  
-    
-#     return answer, final_context
