@@ -214,20 +214,38 @@ def build_grounded_answer(
     # --- NEW: collapse to the single best-matching document group ---
     from collections import defaultdict
     import math
+    # --- Normalize 'scored' to a uniform [(overlap:int, Passage), ...] ---
+    norm_scored = []
+    for entry in scored:
+        # cases: (overlap, Passage)  OR  Passage  OR anything else (ignore)
+        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Passage):
+            overlap, p = entry
+            try:
+                overlap = int(overlap)
+            except Exception:
+                overlap = 0
+            norm_scored.append((overlap, p))
+        elif isinstance(entry, Passage):
+            norm_scored.append((0, entry))
+        else:
+            # unknown shape – skip
+            continue
+
+    scored = norm_scored
+    if not scored:
+        # nothing usable; short-circuit to original passages
+        scored = [(0, p) for p in passages]
+
     # score by (sum of overlaps, then best rerank/dense as tie-breakers)
     by_doc = defaultdict(list)
-    for entry in scored:
-        if isinstance(entry, tuple) and len(entry) == 2:
-            overlap, p = entry
-        else:
-            overlap, p = 0, entry  # bare Passage
+    for overlap, p in scored:
         by_doc[p.title or p.doc_id].append((overlap, p))
 
     def group_score(items):
          # items is a list of (overlap, Passage)
         total_overlap = sum(o for o, _ in items)
-        best_rerank = max(((getattr(p, "rerank_score", None) or -math.inf) for _, p in items), default=-math.inf)
-        best_dense  = max(((getattr(p, "score_dense", None)  or -math.inf) for _, p in items), default=-math.inf)
+        best_rerank = max((getattr(p, "rerank_score", None) or -math.inf) for _, p in items)
+        best_dense  = max((getattr(p, "score_dense",  None) or -math.inf) for _, p in items)
         return (total_overlap, best_rerank, best_dense)
 
     # pick the single best group
