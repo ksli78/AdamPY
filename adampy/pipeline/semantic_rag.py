@@ -308,7 +308,7 @@ def build_grounded_answer(
 
     prompt = (
         "Please answer the question using only the provided context. "
-        "Format your response as clean, readable HTML with paragraphs, lists, tables, or headings if useful. "
+        "Always Format your response as clean, readable HTML with paragraphs, lists, tables, or headings if useful."
         "When citing, phrase it like: 'According to section <b>{section title}</b> [n]' "
         "instead of just '[n]'. "
         "Be detailed and natural in tone—avoid robotic phrases like 'the context specifies.' "
