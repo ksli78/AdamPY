@@ -163,6 +163,10 @@ def rerank(
 ) -> List[Passage]:
     texts = [p.text for p in passages]
     scores = reranker.score(query, texts)
+    for p, s in zip(passages, scores):
+        p.rerank_score = s
+    ranked = sorted(passages, key=lambda x: x.rerank_score or 0.0, reverse=True)
+
     try:
         logger.debug("rerank: in=%d out=%d", len(passages), min(len(passages), keep))
         for i, p in enumerate(ranked[:10]):
@@ -177,9 +181,6 @@ def rerank(
     except Exception as e:
         logger.debug("rerank: failed logging: %s", e)
 
-    for p, s in zip(passages, scores):
-        p.rerank_score = s
-    ranked = sorted(passages, key=lambda x: x.rerank_score or 0.0, reverse=True)
     return ranked[:keep]
 
 def build_grounded_answer(
@@ -213,7 +214,34 @@ def build_grounded_answer(
     # prefer passages with any query-term overlap; if none, keep originals
     scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
     passages = [p for _, p in scored][:TOP_N]
+    # --- NEW: collapse to the single best-matching document group ---
+    from collections import defaultdict
+    # score by (sum of overlaps, then best rerank/dense as tie-breakers)
+    by_doc = defaultdict(list)
+    for overlap, p in scored:
+        by_doc[p.title or p.doc_id].append((overlap, p))
+
+    def group_score(items):
+        # total term overlap across the doc's chunks
+        total_overlap = sum(o for o, _ in items)
+        # best available numeric score to help tie-break (prefers higher rerank/dense)
+        best_rerank = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in items)
+        best_dense  = max((getattr(p, "score_dense", None) or float("-inf")) for _, p in items)
+        return (total_overlap, best_rerank, best_dense)
+
+    # pick the single best group
+    best_title, best_items = max(by_doc.items(), key=group_score)
+
+    # keep only passages from that doc, still favoring overlap
+    best_items.sort(key=lambda x: (x[0] > 0, x[0],
+                               (getattr(x[1], "rerank_score", None) or float("-inf")),
+                               (getattr(x[1], "score_dense", None) or float("-inf"))),
+                    reverse=True)
     
+    # reduce context to tight top-k from the chosen doc
+    TOP_N_FROM_BEST_DOC = 4
+    passages = [p for _, p in best_items[:TOP_N_FROM_BEST_DOC]]
+
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
         context_lines.append(f"[{idx}] TITLE: {p.title}\n{p.text}")
