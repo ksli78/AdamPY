@@ -72,6 +72,7 @@ def dense_retrieve(chroma_collection, query: str, k: int) -> List[Passage]:
         n_results=k,
         include=["documents", "metadatas", "distances"],
     )
+    logger.debug("dense_retrieve")
     passages: List[Passage] = []
     ids = res.get("ids", [[]])[0]
     docs = res.get("documents", [[]])[0]
@@ -154,6 +155,7 @@ def build_grounded_answer(
     passages: List[Passage],
 ) -> tuple[str, List[Dict[str, Any]]]:
     context_lines = []
+    logger.debug("in build_grounded_answer")
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
         context_lines.append(f"[{idx}] {p.text}")
