@@ -192,24 +192,28 @@ def build_grounded_answer(
     
     import re
     
-    def _simple_terms(s: str) -> set[str]:
-        # tiny tokenizer, lowercases and drops 1-char tokens
-        return {t for t in re.findall(r"\w+", s.lower()) if len(t) > 1}
+    def _strip_header(t: str) -> str:
+        # remove the leading DOC/PATH/FILE banner your pipeline prepends
+        return re.sub(r'^DOC:.*?\nPATH:.*?\nFILE:.*?\n\n', '', t, flags=re.S)
+    
+    def _terms(s: str) -> set[str]:
+        return {w for w in re.findall(r'\w+', (s or '').lower()) if len(w) > 1}
     
     # pick passages with any query-term overlap; if none match, keep originals
-    q_terms = _simple_terms(query)
+    q_terms = _terms(query)
     scored = []
     # send a smaller, more focused context (tweak N as you like)
     TOP_N = 6
-    passages = [p for _, p in scored][:TOP_N]
-
     for p in passages:
-        p_terms = _simple_terms(p.text or "")
-        overlap = len(q_terms & p_terms)
+        cleaned = _strip_header(p.text or "")
+        p.text = cleaned  # mutate in place so everything downstream uses the clean text
+        overlap = len(q_terms & _terms(cleaned))
         scored.append((overlap, p))
-    # prefer overlapping passages, then original order
-    scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
 
+    # prefer passages with any query-term overlap; if none, keep originals
+    scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
+    passages = [p for _, p in scored][:TOP_N]
+    
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
         context_lines.append(f"[{idx}] TITLE: {p.title}\n{p.text}")
@@ -226,16 +230,15 @@ def build_grounded_answer(
         )
     context = "\n\n".join(context_lines)
     # Log the full context for grounding (requested at line ~156)
-    try:
-        titles = [f"[{i+1}] {p.title}" for i, p in enumerate(passages)]
-        logger.debug("build_grounded_answer: titles=%s", "; ".join(titles))
-    except Exception:
-        pass
+    logger.debug("build_grounded_answer: titles=%s", "; ".join(f"[{i+1}] {p.title}" for i,p in enumerate(passages)))
+    logger.debug("build_grounded_answer: context=%s", context)
 
     prompt = (
-        "Answer only using the provided context. Cite passages with bracketed numbers [1], [2], ..."
-        " matching the context items. If the answer is not supported, say you don't have enough information."
+        "Answer only using the provided context. Cite passages with [1], [2], ... "
+        "If any part of the question is addressed in the context, extract and summarise it directly; "
+        "only say you don't have enough information if the context truly lacks it."
         f"\n\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
     )
+
     answer = ollama_client.generate(prompt)
     return answer, final_context
