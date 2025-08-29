@@ -242,10 +242,30 @@ def build_grounded_answer(
         by_doc[p.title or p.doc_id].append((overlap, p))
 
     def group_score(items):
-         # items is a list of (overlap, Passage)
-        total_overlap = sum(o for o, _ in items)
-        best_rerank = max((getattr(p, "rerank_score", None) or -math.inf) for _, p in items)
-        best_dense  = max((getattr(p, "score_dense",  None) or -math.inf) for _, p in items)
+        # Normalize: ensure we are working with a list of (overlap:int, Passage) pairs
+        norm = []
+        for it in items:
+            if isinstance(it, tuple) and len(it) >= 2 and isinstance(it[1], Passage):
+                overlap, p = it[0], it[1]
+            elif isinstance(it, Passage):
+                overlap, p = 0, it
+            else:
+                # Unknown shape; skip
+                continue
+            try:
+                overlap = int(overlap)
+            except Exception:
+                overlap = 0
+            norm.append((overlap, p))
+
+        # If nothing valid, score as zeroes
+        if not norm:
+            return (0, float("-inf"), float("-inf"))
+
+        # Now compute scores safely
+        total_overlap = sum(o for o, _ in norm)
+        best_rerank  = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in norm)
+        best_dense   = max((getattr(p, "score_dense",  None) or float("-inf")) for _, p in norm)
         return (total_overlap, best_rerank, best_dense)
 
     # pick the single best group
