@@ -144,10 +144,7 @@ def rrf_fuse(lists: List[List[Passage]], k_keep: int = 50) -> List[Passage]:
 
     return ranked[:k_keep]
 
-
-
 _reranker = None
-
 
 def load_reranker_or_reuse():
     global _reranker
@@ -185,7 +182,6 @@ def rerank(
     ranked = sorted(passages, key=lambda x: x.rerank_score or 0.0, reverse=True)
     return ranked[:keep]
 
-
 def build_grounded_answer(
     ollama_client: OllamaClient,
     query: str,
@@ -193,19 +189,40 @@ def build_grounded_answer(
 ) -> tuple[str, List[Dict[str, Any]]]:
     context_lines = []
     logger.debug("in build_grounded_answer")
+    
+    import re
+    
+    def _simple_terms(s: str) -> set[str]:
+        # tiny tokenizer, lowercases and drops 1-char tokens
+        return {t for t in re.findall(r"\w+", s.lower()) if len(t) > 1}
+    
+    # pick passages with any query-term overlap; if none match, keep originals
+    q_terms = _simple_terms(query)
+    scored = []
+    # send a smaller, more focused context (tweak N as you like)
+    TOP_N = 6
+    passages = [p for _, p in scored][:TOP_N]
+
+    for p in passages:
+        p_terms = _simple_terms(p.text or "")
+        overlap = len(q_terms & p_terms)
+        scored.append((overlap, p))
+    # prefer overlapping passages, then original order
+    scored.sort(key=lambda x: (x[0] > 0, x[0]), reverse=True)
+
     final_context: List[Dict[str, Any]] = []
     for idx, p in enumerate(passages, start=1):
-        context_lines.append(f"[{idx}] {p.text}")
+        context_lines.append(f"[{idx}] TITLE: {p.title}\n{p.text}")
         final_context.append(
-            {
-                "citation_id": idx,
-                "doc_id": p.doc_id,
-                "chunk_id": p.chunk_id,
-                "title": p.title,
-                "url": p.url,
-                "span_start": 0,
-                "span_end": len(p.text),
-            }
+        {
+            "citation_id": idx,
+            "doc_id": p.doc_id,
+            "chunk_id": p.chunk_id,
+            "title": p.title,
+            "url": p.url,
+            "span_start": 0,
+            "span_end": len(p.text),
+        }
         )
     context = "\n\n".join(context_lines)
     # Log the full context for grounding (requested at line ~156)
