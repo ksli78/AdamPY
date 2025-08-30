@@ -29,7 +29,14 @@ class Settings:
     OLLAMA_TOP_K: int = 40
     OLLAMA_REPEAT_PENALTY: float = 1.1
     OLLAMA_NUM_PREDICT: int = 1280
+    OLLAMA_SEED : Optional[int] = None
+    OLLAMA_PRESENCE_PENALTY: float = 0.0
+    OLLAMA_FREQUENCY_PENALTY: float = 0.0
+    OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
+    OLLAMA_MIROSTAT_TAU: float = 5.0
+    OLLAMA_MIROSTAT_ETA: float = 0.1
     OLLAMA_STOP: Optional[List[str]] = None  # e.g., ["###", "</s>"]
+
 
     # ---- Reranker / embeddings / storage ----
     RERANKER_MODEL_PATH: str = "/opt/rag-models/bge-reranker-v2-m3"
@@ -57,7 +64,14 @@ class Settings:
     @property
     def OLLAMA_HOST(self) -> str:  # pragma: no cover - simple alias
         return self.OLLAMA_URL
-
+    
+    def __post_init__(self):
+            self.ALIAS_MAP = {
+                "Adam Lite": "adam-lite:latest",
+                "adam-lite": "adam-lite:latest",
+                "llama3:8b": "llama3:8b",
+                "mistral-7b-instruct": "mistral-7b-instruct:latest",
+            }
 # Base settings object (immutable)
 _base = Settings(ALIAS_MAP={})  # set default empty dict so it’s usable
 
