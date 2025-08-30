@@ -85,34 +85,44 @@ logger = logging.getLogger("rag")  # configure in main.py to output to journald 
 #                 data = json.loads(raw.decode("utf-8"))
 #                 response_text += data.get("response", "")
 #         return response_text
-class OllamaClient: 
-    def __init__(self, host: Optional[str] = None): 
-        self.host = (host or settings.OLLAMA_HOST).rstrip("/") 
-        def generate( 
-                self, prompt: str, 
-                model: str = "llama3:8b", 
-                temperature: 
-                float = 0.2, 
-                max_tokens: int = 512, 
-                stop: Optional[List[str]] = None, 
-            ) -> str:
-            payload = { 
-                "model": model, 
-                "prompt": prompt, 
-                "temperature": temperature, 
-                "max_tokens": max_tokens, 
-            } 
-            if stop: 
-                payload["stop"] = stop 
-            
-            url = f"{self.host}/api/generate" 
-            request_data = json.dumps(payload).encode("utf-8") 
-            req = urlrequest.Request(url, data=request_data, headers={"Content-Type": "application/json"}) 
-            response_text = "" 
-            with urlrequest.urlopen(req) as resp: 
-                for raw in resp: 
-                    if not raw: 
-                        continue 
-                    data = json.loads(raw.decode("utf-8")) 
-                    response_text += data.get("response", "") 
-            return response_text
+class OllamaClient:
+    def __init__(self, host: Optional[str] = None):
+        # If no host is provided, this falls back to a settings file.
+        # self.host = (host or settings.OLLAMA_HOST).rstrip("/")
+        # For demonstration, let's use a default value directly:
+        self.host = (host or "http://localhost:11434").rstrip("/")
+
+    def generate(
+        self,
+        prompt: str,
+        model: str = "llama3:8b",
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+        stop: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Generates a response from the Ollama API.
+        """
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,  # Added for a single, complete response
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "stop": stop or [],
+            }
+        }
+        
+        url = f"{self.host}/api/generate"
+        request_data = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(
+            url,
+            data=request_data,
+            headers={"Content-Type": "application/json"}
+        )
+
+        with urlrequest.urlopen(req) as response:
+            response_body = response.read().decode("utf-8")
+            data = json.loads(response_body)
+            return data.get("response", "")
