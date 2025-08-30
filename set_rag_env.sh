@@ -1,82 +1,59 @@
 #!/usr/bin/env bash
-# set_rag_env.sh — reset then (re)export clean RAG env
+# set_rag_env.sh — safe to source; resets only our app vars, then exports fresh ones.
+# IMPORTANT: no `set -e`/`pipefail` here — we don't want to kill the parent shell.
 
-set -euo pipefail
+# --- 1) Unset our app-related variables (only those we own) ---
+_safe_unset() { unset "$1" 2>/dev/null || true; }
 
-############################################
-# 1) Hard reset: unset all related vars
-############################################
-# Unset by explicit names (common culprits)
-unset CHAT_MODEL || true
-unset SUMMARY_MODEL || true
-unset COLLECTION || true
+# Explicit common names
+for v in CHAT_MODEL SUMMARY_MODEL COLLECTION; do _safe_unset "$v"; done
 
-# Bulk-unset by prefix patterns
-# shellcheck disable=SC2046
-for VAR in $(env | cut -d= -f1 | egrep '^(OLLAMA_.*|SEMRAG_.*|RERANKER_.*|EMBED_.*|CHROMA_DIR|WATCH_DIR|UPLOAD_DIR|INGEST_QUEUE_MAX|CHUNK_.*|STRICT_CITATION_CHECKS|DISPLAY_TOP_K_DEFAULT)$'); do
-  unset "$VAR" || true
-done
+# Patterns (exported vars only)
+while IFS='=' read -r name _; do
+  case "$name" in
+    OLLAMA_*|SEMRAG_*|RERANKER_*|EMBED_*|CHROMA_DIR|WATCH_DIR|UPLOAD_DIR|INGEST_QUEUE_MAX|CHUNK_*|STRICT_CITATION_CHECKS|DISPLAY_TOP_K_DEFAULT)
+      _safe_unset "$name"
+      ;;
+  esac
+done < <(env)
 
-############################################
-# 2) Fresh exports (authoritative values)
-############################################
-set -a  # auto-export everything below
+# --- 2) Export fresh values (authoritative) ---
+export SEMRAG_ENABLED=true
+export SEMRAG_VARIANTS=3
+export SEMRAG_K_PER_VARIANT=50
+export SEMRAG_RRF_CUTOFF=200
+export SEMRAG_RERANK_KEEP=10
+export SEMRAG_USE_HYDE=false
 
-# Retrieval knobs
-SEMRAG_ENABLED=true
-SEMRAG_VARIANTS=3
-SEMRAG_K_PER_VARIANT=50
-SEMRAG_RRF_CUTOFF=200
-SEMRAG_RERANK_KEEP=10
-SEMRAG_USE_HYDE=false
+export OLLAMA_URL="http://127.0.0.1:11434"
+export OLLAMA_KEEP_ALIVE="720m"
 
-# Ollama + reranker
-# NOTE: If you run Ollama elsewhere, update OLLAMA_URL here.
-OLLAMA_URL="http://127.0.0.1:11434"
-OLLAMA_KEEP_ALIVE="720m"
+export RERANKER_MODEL_PATH="/opt/rag-models/bge-reranker-v2-m3"
+export RERANKER_BATCH_SIZE=16
+export RERANKER_MAX_LEN=512
 
-RERANKER_MODEL_PATH="/opt/rag-models/bge-reranker-v2-m3"
-RERANKER_BATCH_SIZE=16
-RERANKER_MAX_LEN=512
+export EMBED_MODEL_DIR="/opt/adam/models/nomic-ai/nomic-embed-text"
+export CHROMA_DIR="/srv/rag/chroma"
+export COLLECTION="docs_v2"
 
-# Embeddings + storage
-EMBED_MODEL_DIR="/opt/adam/models/nomic-ai/nomic-embed-text"
-CHROMA_DIR="/srv/rag/chroma"
-COLLECTION="docs_v2"
+export WATCH_DIR="/srv/rag/watched"
+export UPLOAD_DIR="/srv/rag/uploads"
+export INGEST_QUEUE_MAX=8
 
-# Filesystem
-WATCH_DIR="/srv/rag/watched"
-UPLOAD_DIR="/srv/rag/uploads"
-INGEST_QUEUE_MAX=8
+export CHUNK_SIZE=350
+export CHUNK_OVERLAP=150
 
-# Chunking
-CHUNK_SIZE=350
-CHUNK_OVERLAP=150
+# ✔ Set concrete model IDs; no aliases, no "company-default"
+export CHAT_MODEL="llama3:8b"
+export SUMMARY_MODEL="mistral-7b-instruct"
 
-# Models (authoritative; do NOT leave aliases or “company-default” here)
-CHAT_MODEL="llama3:8b"
-SUMMARY_MODEL="mistral-7b-instruct"
+export STRICT_CITATION_CHECKS=true
+export OLLAMA_TEMPERATURE=0.1
+export OLLAMA_TOP_P=0.9
+export OLLAMA_TOP_K=40
+export OLLAMA_REPEAT_PENALTY=1.1
+export OLLAMA_NUM_PREDICT=1280
 
-# Generation options
-STRICT_CITATION_CHECKS=true
-OLLAMA_TEMPERATURE=0.1
-OLLAMA_TOP_P=0.9
-OLLAMA_TOP_K=40
-OLLAMA_REPEAT_PENALTY=1.1
-OLLAMA_NUM_PREDICT=1280
-# Optional stops (comma-separated or leave empty)
-# OLLAMA_STOP="###,</s>"
+export DISPLAY_TOP_K_DEFAULT=10
 
-# UI
-DISPLAY_TOP_K_DEFAULT=10
-
-set +a  # stop auto-export
-
-############################################
-# 3) Sanity print (helps catch “company-default” quickly)
-############################################
-echo "[set_rag_env] OLLAMA_URL=${OLLAMA_URL}"
-echo "[set_rag_env] CHAT_MODEL=${CHAT_MODEL}"
-echo "[set_rag_env] SUMMARY_MODEL=${SUMMARY_MODEL}"
-echo "[set_rag_env] COLLECTION=${COLLECTION}"
-echo "[set_rag_env] Environment refreshed."
+echo "[set_rag_env] refreshed. CHAT_MODEL=$CHAT_MODEL  OLLAMA_URL=$OLLAMA_URL"
