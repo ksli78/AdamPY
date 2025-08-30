@@ -52,8 +52,29 @@ journal_handler.setFormatter(formatter)
 
 logger.addHandler(journal_handler)
 
-
-
+_DEFAULT_CATEGORY_VOCAB = {
+    "policy", "procedure", "form", "faq",
+    "benefits", "timekeeping", "safety", "it", "hr", 
+    "engineering", "facilities", "procurement"
+}
+# rule-based keyword nudges (helps separate close siblings)
+# Rationale:
+# - CLG-EN-PO-0301 (Work Hours…): mentions Decisions + "Time Off Request" (PTO workflow). 
+# - EN-PO-0276 (Personal Leave): emphasizes unpaid leave mechanics and J375 form.
+# These anchors are strong disambiguators for PTO vs. Personal Leave. 
+# (Adjust to your domain as you add more policies.)
+_RULES = [
+    {
+        "pattern": r"\b(decisions|time off request)\b",
+        "add_keywords": ["PTO", "Time Off Request", "Decisions", "Portal->Tools->Decisions"],
+        "force_category": "policy"
+    },
+    {
+        "pattern": r"\bJ375\b",
+        "add_keywords": ["personal leave", "leave of absence", "unpaid leave", "J375 form"],
+        # keep category from LLM, just add keywords
+    },
+]
 try:
     import requests
 except ModuleNotFoundError:  # pragma: no cover - fallback to urllib
@@ -180,6 +201,79 @@ app.add_middleware(
 
 client = chromadb.PersistentClient(path=settings.CHROMA_DIR)
 
+class InferMetadataRequest(BaseModel):
+    text: str
+    # Optional hints (from your crawler)
+    title: Optional[str] = None
+    doc_code: Optional[str] = None
+    category_vocab: Optional[List[str]] = None  # override/extend defaults
+    max_keywords: int = 12                       # cap the list size
+    lower_keywords: bool = False                 # keep casing by default
+    dedupe_keywords: bool = True
+    apply_rules: bool = True                     # apply _RULES anchors (Decisions/J375) for now
+
+class InferMetadataResponse(BaseModel):
+    summary: str
+    category: str
+    keywords: List[str]
+    debug: Dict[str, List[str]] = {}             # shows what rules matched / changes applied
+
+def _normalize_category(raw: str, vocab: set[str]) -> str:
+    c = (raw or "").strip().lower()
+    if not c:
+        return "policy" if "policy" in vocab else (sorted(vocab)[:1] or ["misc"])[0]
+    # single- or two-word; map common variants
+    c = re.sub(r"[^a-z0-9 ]+", "", c)
+    aliases = {
+        "policies": "policy",
+        "procedures": "procedure",
+        "benefit": "benefits",
+        "time keep|time-?keeping": "timekeeping",
+        "human resources|hr policy|hr": "hr",
+        "information technology|it policy": "it",
+        "q&a|qa|questions|faq": "faq",
+    }
+    for patt, val in aliases.items():
+        if re.fullmatch(patt, c):
+            c = val
+            break
+    return c if c in vocab else (min(vocab, key=lambda v: len(v)) if vocab else c or "misc")
+
+def _clean_keywords(kw: List[str], *, max_n: int, lower: bool, dedupe: bool) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for k in kw or []:
+        s = (k or "").strip()
+        if not s:
+            continue
+        # strip quotes/brackets and punctuation padding
+        s = s.strip(" \t\r\n\"'[](){}")
+        if lower:
+            s = s.lower()
+        if dedupe:
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(s)
+        if len(out) >= max_n:
+            break
+    return out
+
+def _apply_anchor_rules(text: str, existing: List[str], vocab: set[str], apply: bool) -> tuple[List[str], List[str]]:
+    """Return (keywords, hits): add keywords and maybe force category based on rule hits."""
+    hits: List[str] = []
+    kw = list(existing)
+    if not apply:
+        return kw, hits
+    t = text or ""
+    for rule in _RULES:
+        if re.search(rule["pattern"], t, flags=re.I):
+            hits.append(rule["pattern"])
+            for k in rule.get("add_keywords", []):
+                if k not in kw:
+                    kw.append(k)
+    return kw, hits
 
 def _ensure_collection(name: Optional[str] = None):
     """Return a Chroma collection using our embedder, recreating if mismatched.
@@ -278,7 +372,6 @@ _TOKEN_RE = re.compile(r"\b[\w:.-]{3,}\b", re.UNICODE)
 def _tokens_generic(s: str) -> set:
     return set(t.lower() for t in _TOKEN_RE.findall(s or ""))
 
-
 def _extract_passage(text: str, query: str, window_chars: int = 800) -> str:
     """
     Generic passage picker: prefer segments whose tokens overlap with the query.
@@ -328,7 +421,6 @@ def sha1(path: _Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 def read_text(path: _Path) -> str:
     ext = path.suffix.lower()
@@ -467,7 +559,6 @@ def read_text(path: _Path) -> str:
         except Exception:
             return ""
 
-
 def chunk_text(text: str, size: int = settings.CHUNK_SIZE, overlap: int = settings.CHUNK_OVERLAP) -> List[str]:
     text = text.strip()
     if not text:
@@ -499,7 +590,6 @@ def clean_document_text(text: str) -> str:
     cleaned = re.sub(r'\n{2,}', '\n', cleaned)
     cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
     return cleaned.strip()
-
 
 def call_llm(prompt: str) -> str:
     """Send a prompt to the configured LLM and return the raw text response."""
@@ -605,7 +695,6 @@ def upsert_document(path: _Path, source: str) -> int:
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
 
-
 def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     import json
     safe: Dict[str, Any] = {}
@@ -675,7 +764,6 @@ def upsert_text(doc_id: str, text: str, base_meta: Dict[str, Any]) -> int:
         metas.append(m)
     collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
     return len(chunks)
-
 
 def search(query: str, k: int = 4) -> List[Dict[str, Any]]:
     qemb = embed([query])[0]
@@ -787,9 +875,6 @@ def hybrid_rerank(query: str, retriever, reranker_model_name: str,
 
     return result
 
-
-
-
 def rerank_sources(question: str, chunks: List[Dict[str, Any]],
                    debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Rerank retrieved chunks using local BGE scoring."""
@@ -832,7 +917,6 @@ def rerank_sources(question: str, chunks: List[Dict[str, Any]],
             },
         })
     return top
-
 
 def _dehedge(text: str) -> str:
     patterns = [
@@ -1122,8 +1206,6 @@ class QueryBody(BaseModel):
     # Collection selection for /query
     collection: Optional[str] = Field(default="docs_v2", description="Chroma collection name to search")
 
-
-
 class QueryResponse(BaseModel):
     """Response schema for the /query endpoint."""
     answer: str
@@ -1296,8 +1378,6 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         display_k=display_k,
         display_context=display_context,
     )
-
-
 
 # Quick smoke tests:
 # curl -s -X POST http://localhost:8000/query -H 'Content-Type: application/json' \
@@ -2086,4 +2166,51 @@ def ingest_document(req: IngestRequest):
 
     return {"status": "ok", "ingested": ingested, "count": len(ingested)}
 
-## Removed: /delete_sp endpoint
+
+@app.post("/infer_metadata", response_model=InferMetadataResponse)
+def infer_metadata(req: InferMetadataRequest):
+    # 1) Basic cleanup & length guard (reuse your cleaner)
+    raw = (req.text or "").strip()
+    cleaned = clean_document_text(raw)  # you already have this helper
+    if len(cleaned) < 300:
+        raise HTTPException(status_code=400, detail="Document text too short (<300 chars) after cleanup.")
+
+    # 2) Ask your existing LLM summarizer (already wired to SUMMARY_MODEL)
+    summary, category, keywords = summarize_document(cleaned)
+
+    # 3) Normalize category to a controlled vocabulary
+    vocab = set(_DEFAULT_CATEGORY_VOCAB)
+    if req.category_vocab:
+        vocab |= {v.strip().lower() for v in req.category_vocab if v and v.strip()}
+    category_norm = _normalize_category(category, vocab)
+
+    # 4) Compose initial keywords (seed with doc_code/title if present)
+    seed_kw = list(keywords or [])
+    if req.doc_code and req.doc_code not in seed_kw:
+        seed_kw.append(req.doc_code)
+    if req.title and req.title not in seed_kw:
+        seed_kw.append(req.title)
+
+    # 5) Apply anchor rules (Decisions/Time Off Request → PTO; J375 → personal leave)
+    kw_rule_applied, hits = _apply_anchor_rules(cleaned, seed_kw, vocab, req.apply_rules)
+
+    # 6) Final clean, cap, and return
+    final_kw = _clean_keywords(
+        kw_rule_applied,
+        max_n=max(3, min(req.max_keywords, 32)),
+        lower=req.lower_keywords,
+        dedupe=req.dedupe_keywords,
+    )
+
+    # Make sure we always carry the normalized category as a keyword anchor
+    if category_norm not in {k.lower() for k in final_kw}:
+        final_kw = [category_norm] + final_kw
+        # keep under limit
+        final_kw = final_kw[:max(3, min(req.max_keywords, 32))]
+
+    return InferMetadataResponse(
+        summary=(summary or "").strip(),
+        category=category_norm,
+        keywords=final_kw,
+        debug={"rule_hits": hits}
+    )
