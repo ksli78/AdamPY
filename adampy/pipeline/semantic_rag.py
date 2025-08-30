@@ -14,7 +14,14 @@ from ..services.ollama_client import OllamaClient
 
 # Use the app-wide logger configured in main.py to write to journald
 logger = logging.getLogger('rag')
-
+def _to_int(x) -> int:
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
 
 @dataclass
 class Passage:
@@ -241,33 +248,37 @@ def build_grounded_answer(
     # score by (sum of overlaps, then best rerank/dense as tie-breakers)
     by_doc = defaultdict(list)
     for overlap, p in scored:
-        by_doc[p.title or p.doc_id].append((overlap, p))
+        by_doc[p.title or p.doc_id].append((_to_int(overlap), p))
 
     def group_score(items):
-        # Normalize: ensure we are working with a list of (overlap:int, Passage) pairs
-        norm = []
+        # items is an iterable of (overlap, Passage) pairs
+        total_overlap = 0
+        best_rerank = float("-inf")
+        best_dense  = float("-inf")
         for it in items:
-            if isinstance(it, tuple) and len(it) >= 2 and isinstance(it[1], Passage):
-                overlap, p = it[0], it[1]
+            # tolerate odd shapes just in case
+            if isinstance(it, tuple) and len(it) >= 2:
+                o, p = it[0], it[1]
             elif isinstance(it, Passage):
-                overlap, p = 0, it
+                o, p = 0, it
             else:
-                # Unknown shape; skip
                 continue
-            try:
-                overlap = int(overlap)
-            except Exception:
-                overlap = 0
-            norm.append((overlap, p))
 
-        # If nothing valid, score as zeroes
-        if not norm:
-            return (0, float("-inf"), float("-inf"))
+            o = _to_int(o)
+            total_overlap += o
 
-        # Now compute scores safely
-        total_overlap = sum(o for o, _ in norm)
-        best_rerank  = max((getattr(p, "rerank_score", None) or float("-inf")) for _, p in norm)
-        best_dense   = max((getattr(p, "score_dense",  None) or float("-inf")) for _, p in norm)
+            rr = getattr(p, "rerank_score", None)
+            if rr is None:
+                rr = float("-inf")
+            if rr > best_rerank:
+                best_rerank = rr
+
+            ds = getattr(p, "score_dense", None)
+            if ds is None:
+                ds = float("-inf")
+            if ds > best_dense:
+                best_dense = ds
+
         return (total_overlap, best_rerank, best_dense)
 
     # pick the single best group
@@ -276,13 +287,14 @@ def build_grounded_answer(
     # Sort within that doc: overlap first, then rerank, then dense
     best_items.sort(
         key=lambda t: (
-            (t[0] > 0),                      # any overlap
-            t[0],                            # amount of overlap
+            (_to_int(t[0]) > 0),
+            _to_int(t[0]),
             getattr(t[1], "rerank_score", 0) or 0.0,
             getattr(t[1], "score_dense", 0) or 0.0,
         ),
         reverse=True,
     )
+
     
     # reduce context to tight top-k from the chosen doc
     TOP_N_FROM_BEST_DOC = 4
