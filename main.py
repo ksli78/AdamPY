@@ -1177,6 +1177,9 @@ def semantic_query(body: QueryBody) -> QueryResponse:
         if body.rewrite
         else {"rewritten": None, "alternates": [], "hyde": None}
     )
+    
+    logger.debug("After ollama setup"); 
+    logger.debug("Calling %s" , settings.OLLAMA_URL)
 
     query_set = [body.query]
     if variants.get("rewritten"):
@@ -1264,6 +1267,7 @@ def semantic_query(body: QueryBody) -> QueryResponse:
             for i, p in enumerate(reranked)
         ]
 
+    logger.debug("About to call build_ground_answer")
     # 5) Build grounded answer + validate/repair citations
     answer_raw, final_context = build_grounded_answer(ollama, body.query, reranked)
     final_text, phantom_found, phantom_details = validate_and_fix_citations(
