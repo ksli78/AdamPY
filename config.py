@@ -7,10 +7,10 @@ from typing import Dict, List, Optional
 class Settings:
     # ---- Retrieval / RAG knobs ----
     SEMRAG_ENABLED: bool = True
-    SEMRAG_VARIANTS: int = 3
-    SEMRAG_K_PER_VARIANT: int = 50
-    SEMRAG_RRF_CUTOFF: int = 200
-    SEMRAG_RERANK_KEEP: int = 10
+    SEMRAG_VARIANTS: int = 2
+    SEMRAG_K_PER_VARIANT: int = 25
+    SEMRAG_RRF_CUTOFF: int = 80
+    SEMRAG_RERANK_KEEP: int = 50
     SEMRAG_USE_HYDE: bool = False
 
     # ---- Ollama + generation ----
