@@ -53,6 +53,11 @@ class Settings:
     DISPLAY_TOP_K_DEFAULT: int = 10
     STRICT_CITATION_CHECKS: bool = True
 
+      # Back-compat shim: property alias for legacy usages
+    @property
+    def OLLAMA_HOST(self) -> str:  # pragma: no cover - simple alias
+        return self.OLLAMA_URL
+
 # Base settings object (immutable)
 _base = Settings(ALIAS_MAP={})  # set default empty dict so it’s usable
 
@@ -69,5 +74,9 @@ def _apply_overrides(base: Settings, overrides: dict) -> Settings:
     valid = {k: v for k, v in overrides.items() if hasattr(base, k)}
     return replace(base, **valid) if valid else base
 
+
 settings: Settings = _apply_overrides(_base, OVERRIDES)
 
+# Safety guard: never allow the cursed "company-default" to slip in here.
+if settings.CHAT_MODEL.strip().lower() == "company-default":
+    raise RuntimeError("Invalid CHAT_MODEL 'company-default' in config.py/config_local.py; tag it in Ollama or use a real model id.")
