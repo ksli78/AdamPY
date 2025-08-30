@@ -55,7 +55,7 @@ if BaseSettings:
         OLLAMA_MIROSTAT_TAU: float = 5.0
         OLLAMA_MIROSTAT_ETA: float = 0.1
         # Comma-separated list of stop tokens (optional)
-        OLLAMA_STOP: str | None = None
+        OLLAMA_STOP: Optional[str] = None
 
 
 
@@ -147,7 +147,7 @@ else:
         OLLAMA_MIROSTAT_TAU: float = 5.0
         OLLAMA_MIROSTAT_ETA: float = 0.1
         # Comma-separated list of stop tokens (optional)
-        OLLAMA_STOP: str | None = None
+        OLLAMA_STOP: Optional[str]  = None
 
         def __post_init__(self):
             self.ALIAS_MAP = {
