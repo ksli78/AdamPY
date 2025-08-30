@@ -16,22 +16,63 @@ class OllamaClient:
     def generate(
         self,
         prompt: str,
-        model: str = "llama3:8b",
-        temperature: float = 0.2,
-        max_tokens: int = 512,
+        model: Optional[str] = None,
+        # Backward-compatible params (explicit args override settings)
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,          # kept for compatibility
         stop: Optional[List[str]] = None,
+        # New optional knobs (None = take from settings)
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repeat_penalty: Optional[float] = None,
+        num_predict: Optional[int] = None,
+        seed: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        mirostat: Optional[int] = None,
+        mirostat_tau: Optional[float] = None,
+        mirostat_eta: Optional[float] = None,
     ) -> str:
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+        
+        mdl = model or settings.CHAT_MODEL
+        opts = {
+            "temperature": settings.OLLAMA_TEMPERATURE if temperature is None else temperature,
+            "top_p": settings.OLLAMA_TOP_P if top_p is None else top_p,
+            "top_k": settings.OLLAMA_TOP_K if top_k is None else top_k,
+            "repeat_penalty": settings.OLLAMA_REPEAT_PENALTY if repeat_penalty is None else repeat_penalty,
+            "num_predict": (
+                # prefer explicit num_predict, then max_tokens, then settings
+                (num_predict if num_predict is not None else max_tokens)
+                if (num_predict is not None or max_tokens is not None)
+                else settings.OLLAMA_NUM_PREDICT
+            ),
+            "presence_penalty": settings.OLLAMA_PRESENCE_PENALTY if presence_penalty is None else presence_penalty,
+            "frequency_penalty": settings.OLLAMA_FREQUENCY_PENALTY if frequency_penalty is None else frequency_penalty,
+            "mirostat": settings.OLLAMA_MIROSTAT if mirostat is None else mirostat,
+            "mirostat_tau": settings.OLLAMA_MIROSTAT_TAU if mirostat_tau is None else mirostat_tau,
+            "mirostat_eta": settings.OLLAMA_MIROSTAT_ETA if mirostat_eta is None else mirostat_eta,
         }
-        if stop:
-            payload["stop"] = stop
+
+        # Build payload
+        payload = {
+            "model": mdl,
+            "prompt": prompt,
+            "options": {k: v for k, v in opts.items() if v is not None},
+        }
+
+        # Stops: explicit arg wins; otherwise from settings (if provided)
+        stops = stop if stop is not None else getattr(settings, "OLLAMA_STOP", None)
+        if stops:
+            payload["stop"] = stops
+
+        # Keep-alive (optional; often set at model load time, but safe here)
+        if getattr(settings, "OLLAMA_KEEP_ALIVE", None):
+            payload["keep_alive"] = settings.OLLAMA_KEEP_ALIVE
+
         url = f"{self.host}/api/generate"
         request_data = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(url, data=request_data, headers={"Content-Type": "application/json"})
+
         response_text = ""
         with urlrequest.urlopen(req) as resp:
             for raw in resp:

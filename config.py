@@ -10,10 +10,10 @@ if BaseSettings:
     class Settings(BaseSettings):
         # Semantic RAG controls
         SEMRAG_ENABLED: bool = True
-        SEMRAG_VARIANTS: int = 2
-        SEMRAG_K_PER_VARIANT: int = 20
-        SEMRAG_RRF_CUTOFF: int = 100
-        SEMRAG_RERANK_KEEP: int = 15
+        SEMRAG_VARIANTS: int = 3
+        SEMRAG_K_PER_VARIANT: int = 50
+        SEMRAG_RRF_CUTOFF: int = 200
+        SEMRAG_RERANK_KEEP: int = 10
         SEMRAG_USE_HYDE: bool = False
 
         # Ollama + reranker
@@ -26,7 +26,7 @@ if BaseSettings:
         # Embeddings + storage
         EMBED_MODEL_DIR: str = "/opt/adam/models/nomic-ai/nomic-embed-text"
         CHROMA_DIR: str = "/srv/rag/chroma"
-        COLLECTION: str = "doc_v2"
+        COLLECTION: str = "docs_v2"
 
         # Filesystem
         WATCH_DIR: str = "/srv/rag/watched"
@@ -34,12 +34,29 @@ if BaseSettings:
         INGEST_QUEUE_MAX: int = 8
 
         # Chunking
-        CHUNK_SIZE: int = 1400
-        CHUNK_OVERLAP: int = 300
+        CHUNK_SIZE: int = 350
+        CHUNK_OVERLAP: int = 150
 
         # Models
         CHAT_MODEL: str = "llama3:8b"
         SUMMARY_MODEL: str = "mistral-7b-instruct"
+        
+        # Ollama generation options (can be overridden by env)
+        OLLAMA_TEMPERATURE: float = 0.1
+        OLLAMA_TOP_P: float = 0.9
+        OLLAMA_TOP_K: int = 40
+        OLLAMA_REPEAT_PENALTY: float = 1.1
+        OLLAMA_NUM_PREDICT: int = 1280
+        OLLAMA_SEED: int | None = None
+        OLLAMA_PRESENCE_PENALTY: float = 0.0
+        OLLAMA_FREQUENCY_PENALTY: float = 0.0
+        OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
+        OLLAMA_MIROSTAT_TAU: float = 5.0
+        OLLAMA_MIROSTAT_ETA: float = 0.1
+        # Comma-separated list of stop tokens (optional)
+        OLLAMA_STOP: str | None = None
+
+
 
         # Model aliasing
         ALIAS_MAP: dict = {
