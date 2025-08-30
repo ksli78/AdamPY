@@ -1,3 +1,4 @@
+import logging
 import json
 from typing import List, Optional
 
@@ -8,6 +9,7 @@ try:  # Support running as package (e.g., app.config) or module
 except ModuleNotFoundError:  # pragma: no cover - fallback for packaged apps
     from app.config import settings  # type: ignore
 
+logger = logging.getLogger("ollama")  # configure in main.py to output to journald or console
 
 class OllamaClient:
     def __init__(self, host: Optional[str] = None):
@@ -70,6 +72,8 @@ class OllamaClient:
             payload["keep_alive"] = settings.OLLAMA_KEEP_ALIVE
 
         url = f"{self.host}/api/generate"
+        logger.debug("Sending request to Ollama: url=%s payload=%s", url, json.dumps(payload, ensure_ascii=False))
+
         request_data = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(url, data=request_data, headers={"Content-Type": "application/json"})
 
