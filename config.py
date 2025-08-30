@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 try:
     from pydantic_settings import BaseSettings  # type: ignore
@@ -47,7 +48,7 @@ if BaseSettings:
         OLLAMA_TOP_K: int = 40
         OLLAMA_REPEAT_PENALTY: float = 1.1
         OLLAMA_NUM_PREDICT: int = 1280
-        OLLAMA_SEED: int | None = None
+        OLLAMA_SEED:  Optional[int] = None
         OLLAMA_PRESENCE_PENALTY: float = 0.0
         OLLAMA_FREQUENCY_PENALTY: float = 0.0
         OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
@@ -139,7 +140,7 @@ else:
         OLLAMA_TOP_K: int = _get_int("OLLAMA_TOP_K",40)
         OLLAMA_REPEAT_PENALTY: float = _get_float("OLLAMA_REPEAT_PENALTY", 1.1)
         OLLAMA_NUM_PREDICT: int =  _get_int("OLLAMA_NUM_PREDICT", 1280)
-        OLLAMA_SEED: int | None = None
+        OLLAMA_SEED: Optional[int] = None
         OLLAMA_PRESENCE_PENALTY: float = 0.0
         OLLAMA_FREQUENCY_PENALTY: float = 0.0
         OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
