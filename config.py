@@ -86,7 +86,10 @@ else:
 
     def _get_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
-
+    
+    def _get_float(name: str, default: float) -> float:
+        return float(os.getenv(name, str(default)))
+    
     @dataclass
     class Settings:
         # Semantic RAG controls
@@ -129,6 +132,21 @@ else:
 
         # UI display cap (formatting only)
         DISPLAY_TOP_K_DEFAULT: int = _get_int("DISPLAY_TOP_K_DEFAULT", 5)
+
+        # Ollama generation options (can be overridden by env)
+        OLLAMA_TEMPERATURE: float = _get_float("OLLAMA_TEMPERATURE",0.1)
+        OLLAMA_TOP_P: float = _get_float("OLLAMA_TOP_P", 0.9)
+        OLLAMA_TOP_K: int = _get_int("OLLAMA_TOP_K",40)
+        OLLAMA_REPEAT_PENALTY: float = _get_float("OLLAMA_REPEAT_PENALTY", 1.1)
+        OLLAMA_NUM_PREDICT: int =  _get_int("OLLAMA_NUM_PREDICT", 1280)
+        OLLAMA_SEED: int | None = None
+        OLLAMA_PRESENCE_PENALTY: float = 0.0
+        OLLAMA_FREQUENCY_PENALTY: float = 0.0
+        OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
+        OLLAMA_MIROSTAT_TAU: float = 5.0
+        OLLAMA_MIROSTAT_ETA: float = 0.1
+        # Comma-separated list of stop tokens (optional)
+        OLLAMA_STOP: str | None = None
 
         def __post_init__(self):
             self.ALIAS_MAP = {
