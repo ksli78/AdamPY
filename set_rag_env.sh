@@ -1,23 +1,16 @@
-#!/usr/bin/env bash
-# set_rag_env.sh — safe to source; resets only our app vars, then exports fresh ones.
-# IMPORTANT: no `set -e`/`pipefail` here — we don't want to kill the parent shell.
+# set_rag_env_minimal.sh  (POSIX-safe; source this)
+# 1) Unset known app vars (explicit list only)
+unset CHAT_MODEL SUMMARY_MODEL COLLECTION
+unset OLLAMA_URL OLLAMA_KEEP_ALIVE
+unset RERANKER_MODEL_PATH RERANKER_BATCH_SIZE RERANKER_MAX_LEN
+unset EMBED_MODEL_DIR CHROMA_DIR WATCH_DIR UPLOAD_DIR INGEST_QUEUE_MAX
+unset CHUNK_SIZE CHUNK_OVERLAP
+unset SEMRAG_ENABLED SEMRAG_VARIANTS SEMRAG_K_PER_VARIANT SEMRAG_RRF_CUTOFF SEMRAG_RERANK_KEEP SEMRAG_USE_HYDE
+unset DISPLAY_TOP_K_DEFAULT STRICT_CITATION_CHECKS
+unset OLLAMA_TEMPERATURE OLLAMA_TOP_P OLLAMA_TOP_K OLLAMA_REPEAT_PENALTY OLLAMA_NUM_PREDICT
+# add any other noisy vars here if needed; keep it explicit and boring
 
-# --- 1) Unset our app-related variables (only those we own) ---
-_safe_unset() { unset "$1" 2>/dev/null || true; }
-
-# Explicit common names
-for v in CHAT_MODEL SUMMARY_MODEL COLLECTION; do _safe_unset "$v"; done
-
-# Patterns (exported vars only)
-while IFS='=' read -r name _; do
-  case "$name" in
-    OLLAMA_*|SEMRAG_*|RERANKER_*|EMBED_*|CHROMA_DIR|WATCH_DIR|UPLOAD_DIR|INGEST_QUEUE_MAX|CHUNK_*|STRICT_CITATION_CHECKS|DISPLAY_TOP_K_DEFAULT)
-      _safe_unset "$name"
-      ;;
-  esac
-done < <(env)
-
-# --- 2) Export fresh values (authoritative) ---
+# 2) Fresh exports (authoritative)
 export SEMRAG_ENABLED=true
 export SEMRAG_VARIANTS=3
 export SEMRAG_K_PER_VARIANT=50
@@ -43,7 +36,7 @@ export INGEST_QUEUE_MAX=8
 export CHUNK_SIZE=350
 export CHUNK_OVERLAP=150
 
-# ✔ Set concrete model IDs; no aliases, no "company-default"
+# concrete model ids; no aliases; no "company-default"
 export CHAT_MODEL="llama3:8b"
 export SUMMARY_MODEL="mistral-7b-instruct"
 
