@@ -9,7 +9,7 @@ try:  # Support running as package (e.g., app.config) or module
 except ModuleNotFoundError:  # pragma: no cover - fallback for packaged apps
     from app.config import settings  # type: ignore
 
-logger = logging.getLogger("ollama")  # configure in main.py to output to journald or console
+logger = logging.getLogger("rag")  # configure in main.py to output to journald or console
 
 class OllamaClient:
     def __init__(self, host: Optional[str] = None):
