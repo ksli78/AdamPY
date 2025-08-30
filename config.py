@@ -1,6 +1,6 @@
 # config.py — no environment dependency, simple frozen settings
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import Dict, List, Optional
 
 @dataclass(frozen=True)
@@ -21,7 +21,12 @@ class Settings:
     SUMMARY_MODEL: str = "mistral-7b-instruct"
 
     # Optional: map friendly names to real models (kept purely in file)
-    ALIAS_MAP: Dict[str, str] = None  # e.g., {"assistant-small": "llama3:8b"}
+    ALIAS_MAP: Dict[str, str] = field(default_factory=lambda: {
+        "Adam Lite": "adam-lite:latest",
+        "adam-lite": "adam-lite:latest",
+        "llama3:8b": "llama3:8b",
+        "mistral-7b-instruct": "mistral-7b-instruct:latest",
+    })
 
     # Sampling and limits
     OLLAMA_TEMPERATURE: float = 0.1
@@ -29,14 +34,13 @@ class Settings:
     OLLAMA_TOP_K: int = 40
     OLLAMA_REPEAT_PENALTY: float = 1.1
     OLLAMA_NUM_PREDICT: int = 1280
-    OLLAMA_SEED : Optional[int] = None
+    OLLAMA_SEED: Optional[int] = None
     OLLAMA_PRESENCE_PENALTY: float = 0.0
     OLLAMA_FREQUENCY_PENALTY: float = 0.0
     OLLAMA_MIROSTAT: int = 0              # 0=off, 1 or 2 to enable
     OLLAMA_MIROSTAT_TAU: float = 5.0
     OLLAMA_MIROSTAT_ETA: float = 0.1
     OLLAMA_STOP: Optional[List[str]] = None  # e.g., ["###", "</s>"]
-
 
     # ---- Reranker / embeddings / storage ----
     RERANKER_MODEL_PATH: str = "/opt/rag-models/bge-reranker-v2-m3"
@@ -60,20 +64,14 @@ class Settings:
     DISPLAY_TOP_K_DEFAULT: int = 10
     STRICT_CITATION_CHECKS: bool = True
 
-      # Back-compat shim: property alias for legacy usages
+    # Back-compat shim: property alias for legacy usages
     @property
     def OLLAMA_HOST(self) -> str:  # pragma: no cover - simple alias
         return self.OLLAMA_URL
-    
-    def __post_init__(self):
-            self.ALIAS_MAP = {
-                "Adam Lite": "adam-lite:latest",
-                "adam-lite": "adam-lite:latest",
-                "llama3:8b": "llama3:8b",
-                "mistral-7b-instruct": "mistral-7b-instruct:latest",
-            }
+
+
 # Base settings object (immutable)
-_base = Settings(ALIAS_MAP={})  # set default empty dict so it’s usable
+_base = Settings()
 
 # Optional local overrides without using env vars.
 # Create a sibling file config_local.py with:
@@ -88,9 +86,11 @@ def _apply_overrides(base: Settings, overrides: dict) -> Settings:
     valid = {k: v for k, v in overrides.items() if hasattr(base, k)}
     return replace(base, **valid) if valid else base
 
-
 settings: Settings = _apply_overrides(_base, OVERRIDES)
 
 # Safety guard: never allow the cursed "company-default" to slip in here.
 if settings.CHAT_MODEL.strip().lower() == "company-default":
-    raise RuntimeError("Invalid CHAT_MODEL 'company-default' in config.py/config_local.py; tag it in Ollama or use a real model id.")
+    raise RuntimeError(
+        "Invalid CHAT_MODEL 'company-default' in config.py/config_local.py; "
+        "tag it in Ollama or use a real model id."
+    )
