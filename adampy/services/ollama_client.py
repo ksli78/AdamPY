@@ -72,8 +72,8 @@ class OllamaClient:
         if getattr(settings, "OLLAMA_KEEP_ALIVE", None):
             payload["keep_alive"] = settings.OLLAMA_KEEP_ALIVE
 
-        url = f"http://127.0.0.1:11434/api/generate"
-        logger.info("Sending request to Ollama: url=%s payload=%s", url, json.dumps(payload, ensure_ascii=False))
+        url = f"{self.host}/api/generate"
+        logger.debug("Sending request to Ollama: url=%s payload=%s", url, json.dumps(payload, ensure_ascii=False))
 
         request_data = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(url, data=request_data, headers={"Content-Type": "application/json"})

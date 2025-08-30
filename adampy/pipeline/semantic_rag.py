@@ -328,6 +328,7 @@ def build_grounded_answer(
         "If the information is not in the context, reply in a friendly way, e.g.: "
         "'I couldn’t find that information in the available documents. If you believe this should be available, "
         "please contact the IT Department for assistance.'"
+        "Never use words in your response like 'According to the provided context' or 'The provided context' treat context as the 'information you have' answer with 'according to the information I have' or something similar"
     )
     prompt = (
         f"{STYLE_INSTRUCTIONS}\n\n"
