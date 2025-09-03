@@ -53,9 +53,18 @@ journal_handler.setFormatter(formatter)
 logger.addHandler(journal_handler)
 
 _DEFAULT_CATEGORY_VOCAB = {
+    # existing types (policy, procedure, form, faq, etc.)
     "policy", "procedure", "form", "faq",
-    "benefits", "timekeeping", "safety", "it", "hr", 
-    "engineering", "facilities", "procurement"
+    "benefits", "timekeeping", "safety", "it", "hr",
+    "engineering", "facilities", "procurement",
+    # add SharePoint functional areas:
+    "contract management", "employee resources",
+    "management resources", "product support",
+    "quality & compliance", "science",
+    "information technology", "operations & test",
+    "business office", "cptio", "opm",
+    "performance office", "pmdo",
+    "safety & mission assurance", "security"
 }
 # rule-based keyword nudges (helps separate close siblings)
 # Rationale:
@@ -225,13 +234,25 @@ def _normalize_category(raw: str, vocab: set[str]) -> str:
     # single- or two-word; map common variants
     c = re.sub(r"[^a-z0-9 ]+", "", c)
     aliases = {
-        "policies": "policy",
-        "procedures": "procedure",
-        "benefit": "benefits",
-        "time keep|time-?keeping": "timekeeping",
-        "human resources|hr policy|hr": "hr",
-        "information technology|it policy": "it",
-        "q&a|qa|questions|faq": "faq",
+       # existing mappings…
+       "policies": "policy",
+       "procedures": "procedure",
+       "benefit": "benefits",
+       "time keep|time-?keeping": "timekeeping",
+       "human resources|hr policy|hr": "hr",
+       "information technology|it policy|it": "information technology",
+       "engineering department|engineering|jets|flight lab": "engineering",
+       "analysis|assembly and fabrication|certification and acceptance|configuration management|design|software engineering|systems engineering|guidance navigation & control|operations and integration|project risk management|verification and validation|eee parts": "engineering",
+       "manufacturing|procurements|subcontracts|procurement|shipping and receiving": "product support",
+       "goals|innovations|jets management|management system|to management|security": "contract management",
+       "career development|employee information|onboarding|timekeeping|training": "employee resources",
+       "requisitions|resource management|telecommuting": "management resources",
+       "facility safety|flight safety|ppe|safety management": "safety",
+       "facility maintenance|facility management|pressure systems|property management|tspf ms matrix": "facilities",
+       "quality assurance|quality control|gidep": "quality & compliance",
+       "science|research": "science",
+       "it policies and procedures|it policies": "information technology"
+       # add any other relevant patterns from your SharePoint taxonomy
     }
     for patt, val in aliases.items():
         if re.fullmatch(patt, c):
