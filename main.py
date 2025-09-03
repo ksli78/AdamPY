@@ -2164,7 +2164,7 @@ def ingest_document(req: IngestRequest):
             "url": ch.sp_web_url,
         })
 
-    return {"status": "ok", "ingested": ingested, "count": len(ingested)}
+    return {"success": True,  "chunks": len(ingested)}
 
 
 @app.post("/infer_metadata", response_model=InferMetadataResponse)
