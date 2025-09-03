@@ -53,10 +53,6 @@ journal_handler.setFormatter(formatter)
 logger.addHandler(journal_handler)
 
 _DEFAULT_CATEGORY_VOCAB = {
-    # existing types (policy, procedure, form, faq, etc.)
-    "policy", "procedure", "form", "faq",
-    "benefits", "timekeeping", "safety", "it", "hr",
-    "engineering", "facilities", "procurement",
     # add SharePoint functional areas:
     "contract management", "employee resources",
     "management resources", "product support",
@@ -235,10 +231,6 @@ def _normalize_category(raw: str, vocab: set[str]) -> str:
     c = re.sub(r"[^a-z0-9 ]+", "", c)
     aliases = {
        # existing mappings…
-       "policies": "policy",
-       "procedures": "procedure",
-       "benefit": "benefits",
-       "time keep|time-?keeping": "timekeeping",
        "human resources|hr policy|hr": "hr",
        "information technology|it policy|it": "information technology",
        "engineering department|engineering|jets|flight lab": "engineering",
