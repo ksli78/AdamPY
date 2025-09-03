@@ -65,8 +65,8 @@ _DEFAULT_CATEGORY_VOCAB = {
 # (Adjust to your domain as you add more policies.)
 _RULES = [
     {
-        "pattern": r"\b(decisions|time off request)\b",
-        "add_keywords": ["PTO", "Time Off Request", "Decisions", "Portal->Tools->Decisions"],
+        "pattern": r"\b(time off request)\b",  # no bare “decisions”
+        "add_keywords": ["PTO","Time Off Request","Portal->Tools->Decisions"],
         "force_category": "policy"
     },
     {
